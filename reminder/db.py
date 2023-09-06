@@ -13,199 +13,222 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import Optional, Iterator, Dict, List
+from __future__ import annotations
+import logging
+
+from typing import Optional, Iterator, Dict, List, DefaultDict
 from datetime import datetime
+from collections import defaultdict
+from .util import validate_timezone, validate_locale, UserInfo
 
 import pytz
-from sqlalchemy import (Column, String, Integer, Text, DateTime, ForeignKey, Table, MetaData,
-                        select, and_)
-from sqlalchemy.engine.base import Engine
+
+from mautrix.util.async_db import Database
 
 from mautrix.types import UserID, EventID, RoomID
+from typing import Dict, Literal, TYPE_CHECKING
 
-from .util import ReminderInfo
+
+if TYPE_CHECKING:
+    from .bot import ReminderBot
+
+from .reminder import Reminder
+
+
+logger = logging.getLogger(__name__)
 
 
 class ReminderDatabase:
-    reminder: Table
-    reminder_target: Table
-    timezone: Table
-    tz_cache: Dict[UserID, pytz.timezone]
-    locale_cache: Dict[UserID, List[str]]
-    db: Engine
+    cache: DefaultDict[UserID, UserInfo]
+    db: Database
+    defaults: UserInfo
 
-    def __init__(self, db: Engine) -> None:
+    def __init__(self, db: Database, defaults: UserInfo = UserInfo()) -> None:
         self.db = db
-        self.tz_cache = {}
-        self.locale_cache = {}
+        self.cache = defaultdict()
+        self.defaults = defaults
 
-        meta = MetaData()
-        meta.bind = db
 
-        self.reminder = Table("reminder", meta,
-                              Column("id", Integer, primary_key=True, autoincrement=True),
-                              Column("date", DateTime, nullable=False),
-                              Column("room_id", String(255), nullable=False),
-                              Column("event_id", String(255), nullable=False),
-                              Column("message", Text, nullable=False),
-                              Column("reply_to", String(255), nullable=True))
-        self.reminder_target = Table("reminder_target", meta,
-                                     Column("reminder_id", Integer,
-                                            ForeignKey("reminder.id", ondelete="CASCADE"),
-                                            primary_key=True),
-                                     Column("user_id", String(255), primary_key=True),
-                                     Column("event_id", String(255), nullable=False))
-        self.timezone = Table("timezone", meta,
-                              Column("user_id", String(255), primary_key=True),
-                              Column("timezone", String(255), nullable=False))
-        self.locale = Table("locale", meta,
-                            Column("user_id", String(255), primary_key=True),
-                            Column("locales", String(255), nullable=False))
+    async def get_user_info(self, user_id: UserID) -> UserInfo:
+        """ Get the timezone and locale for a user. Data is cached in memory.
+        Args:
+            user_id: ID for the user to query
+        Returns:
+            UserInfo: a dataclass with keys: 'locale' and 'timezone'
+        """
+        if user_id not in self.cache:
+            query = "SELECT timezone, locale FROM user_settings WHERE user_id = $1"
+            row = dict(await self.db.fetchrow(query, user_id) or {})
 
-        meta.create_all()
+            locale = row.get("locale", self.defaults.locale)
+            timezone = row.get("timezone", self.defaults.timezone)
 
-    def set_timezone(self, user_id: UserID, tz: pytz.timezone) -> None:
-        with self.db.begin() as tx:
-            tx.execute(self.timezone.delete().where(self.timezone.c.user_id == user_id))
-            tx.execute(self.timezone.insert().values(user_id=user_id, timezone=tz.zone))
-        self.tz_cache[user_id] = tz
+            # If fetched locale is invalid, use default one
+            if not locale or not validate_locale(locale):
+                locale = self.defaults.locale
 
-    def get_timezone(self, user_id: UserID, default_tz: Optional[pytz.timezone] = None
-                     ) -> Optional[pytz.timezone]:
-        try:
-            return self.tz_cache[user_id]
-        except KeyError:
-            rows = self.db.execute(select([self.timezone.c.timezone])
-                                   .where(self.timezone.c.user_id == user_id))
-            try:
-                self.tz_cache[user_id] = pytz.timezone(next(rows)[0])
-            except (pytz.UnknownTimeZoneError, StopIteration, IndexError):
-                self.tz_cache[user_id] = default_tz or pytz.UTC
-            return self.tz_cache[user_id]
+            # If fetched timezone is invalid, use default one
+            if not timezone or not validate_timezone(timezone):
+                timezone = self.defaults.timezone
 
-    def set_locales(self, user_id: UserID, locales: List[str]) -> None:
-        with self.db.begin() as tx:
-            tx.execute(self.locale.delete().where(self.locale.c.user_id == user_id))
-            tx.execute(self.locale.insert().values(user_id=user_id, locales=",".join(locales)))
-        self.locale_cache[user_id] = locales
+            self.cache[user_id] = UserInfo(locale=locale, timezone=timezone)
 
-    def get_locales(self, user_id: UserID) -> List[str]:
-        try:
-            return self.locale_cache[user_id]
-        except KeyError:
-            rows = self.db.execute(select([self.locale.c.locales])
-                                   .where(self.locale.c.user_id == user_id))
-            try:
-                self.locale_cache[user_id] = next(rows)[0].split(",")
-            except (StopIteration, IndexError):
-                self.locale_cache[user_id] = ["en_iso"]
-            return self.locale_cache[user_id]
+        return self.cache[user_id]
 
-    def all_for_user(self, user_id: UserID, room_id: Optional[RoomID] = None
-                     ) -> Iterator[ReminderInfo]:
-        where = [self.reminder.c.id == self.reminder_target.c.reminder_id,
-                 self.reminder_target.c.user_id == user_id,
-                 self.reminder.c.date > datetime.now(tz=pytz.UTC)]
-        if room_id:
-            where.append(self.reminder.c.room_id == room_id)
-        rows = self.db.execute(select([self.reminder]).where(and_(*where)))
+
+    async def set_user_info(self, user_id: UserID, key: Literal["timezone", "locale"], value: str) -> None:
+        # Make sure user_info is populated first
+        await self.get_user_info(user_id)
+        # Update cache
+        setattr(self.cache[user_id], key, value)
+        # Update the db
+        q = """
+        INSERT INTO user_settings (user_id, {0}) 
+        VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET {0} = EXCLUDED.{0}
+        """.format(key)
+        await self.db.execute(q, user_id, value)
+
+    async def store_reminder(self, reminder: Reminder) -> None:
+        """Add a new reminder in the database"""
+        # hella messy but I don't know what else to do that works with both asyncpg and aiosqlite
+        await self.db.execute("""
+        INSERT INTO reminder (
+        event_id,
+        room_id,
+        start_time,
+        message,
+        reply_to,
+        cron_tab,
+        recur_every,
+        is_agenda,
+        creator
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        """,
+            reminder.event_id,
+            reminder.room_id,
+            reminder.start_time.replace(microsecond=0).isoformat() if reminder.start_time else None,
+            reminder.message,
+            reminder.reply_to,
+            reminder.cron_tab,
+            reminder.recur_every,
+            reminder.is_agenda,
+            reminder.creator)
+
+
+    async def load_all(self, bot: ReminderBot) -> Dict[EventID, Reminder]:
+        """ Load all reminders in the database and return them as a dict for the main bot
+        Args:
+            bot: it feels dirty to do it this way, but it seems to work and make code cleaner but feel free to fix this
+        Returns:
+            a dict of Reminders, with the event id as the key.
+        """
+        rows = await self.db.fetch("""
+                SELECT
+                    event_id,
+                    room_id,
+                    message,
+                    reply_to,
+                    start_time,
+                    recur_every,
+                    cron_tab,
+                    is_agenda,
+                    user_id,
+                    confirmation_event,
+                    subscribing_event,
+                    creator
+                FROM reminder NATURAL JOIN reminder_target
+            """)
+        logger.debug(f"Loaded {len(rows)} reminders")
+        reminders = {}
         for row in rows:
-            yield ReminderInfo(id=row[0], date=row[1].replace(tzinfo=pytz.UTC), room_id=row[2],
-                               event_id=row[3], message=row[4], reply_to=row[5], users=[user_id])
+            # Reminder subscribers are stored in a separate table instead of in an array type for sqlite support
+            if row["event_id"] in reminders:
+                # reminders[row["event_id"]].subscribed_users.append(row["user_id"])
+                reminders[row["event_id"]].subscribed_users[row["user_id"]] = row["subscribing_event"]
+                continue
 
-    def get(self, id: int) -> Optional[ReminderInfo]:
-        return self._get_one(self.reminder.c.id == id)
+            start_time = datetime.fromisoformat(row["start_time"]) if row["start_time"] else None
 
-    def get_by_event_id(self, event_id: EventID) -> Optional[ReminderInfo]:
-        reminder = self._get_one(self.reminder.c.event_id == event_id)
-        if reminder:
-            return reminder
-        rows = self.db.execute(select([self.reminder_target.c.reminder_id])
-                               .where(self.reminder_target.c.event_id == event_id))
-        try:
-            reminder_id = int(next(rows)[0])
-            return self.get(reminder_id)
-        except (StopIteration, IndexError, ValueError):
-            return None
+            if start_time and not row["is_agenda"]:
+                # If this is a one-off reminder whose start time is in the past, then it will
+                # never fire. Ignore and delete the row from the db
+                if not row["recur_every"] and not row["cron_tab"]:
+                    now = datetime.now(tz=pytz.UTC)
 
-    def _get_one(self, whereclause) -> Optional[ReminderInfo]:
-        rows = self.db.execute(select([self.reminder, self.reminder_target.c.user_id,
-                                       self.reminder_target.c.event_id]).where(
-            and_(whereclause, self.reminder_target.c.reminder_id == self.reminder.c.id)))
-        try:
-            first_row = next(rows)
-        except StopIteration:
-            return None
-        info = ReminderInfo(id=first_row[0], date=first_row[1].replace(tzinfo=pytz.UTC),
-                            room_id=first_row[2], event_id=first_row[3], message=first_row[4],
-                            reply_to=first_row[5], users={first_row[6]: first_row[7]})
-        for row in rows:
-            info.users[row[6]] = row[7]
-        return info
+                    if start_time < now:
+                        logger.warning(
+                            "Deleting missed reminder in room %s: %s - %s",
+                            row["room_id"],
+                            row["start_time"],
+                            row["message"],
+                        )
+                        await self.delete_reminder(row["event_id"])
+                        continue
 
-    def _get_many(self, whereclause) -> Iterator[ReminderInfo]:
-        rows = self.db.execute(select([self.reminder, self.reminder_target.c.user_id,
-                                       self.reminder_target.c.event_id])
-                               .where(whereclause)
-                               .order_by(self.reminder.c.id, self.reminder.c.date))
-        building_reminder = None
-        for row in rows:
-            if building_reminder is not None:
-                if building_reminder.id == row[0]:
-                    building_reminder.users[row[6]] = row[7]
-                    continue
-                yield building_reminder
-            building_reminder = ReminderInfo(id=row[0], date=row[1].replace(tzinfo=pytz.UTC),
-                                             room_id=row[2], event_id=row[3], message=row[4],
-                                             reply_to=row[5], users={row[6]: row[7]})
-        if building_reminder is not None:
-            yield building_reminder
+            reminders[row["event_id"]] = Reminder(
+                bot=bot,
+                event_id=row["event_id"],
+                room_id=row["room_id"],
+                message=row["message"],
+                reply_to=row["reply_to"],
+                start_time=start_time,
+                recur_every=row["recur_every"],
+                cron_tab=row["cron_tab"],
+                is_agenda=row["is_agenda"],
+                subscribed_users={row["subscribing_event"]: row["user_id"]},
+                creator=row["creator"],
+                user_info= await self.get_user_info(row["creator"]),
+                confirmation_event=row["confirmation_event"],
+            )
 
-    def all(self) -> Iterator[ReminderInfo]:
-        yield from self._get_many(self.reminder_target.c.reminder_id == self.reminder.c.id)
+        return reminders
 
-    def all_in_range(self, after: datetime, before: datetime) -> Iterator[ReminderInfo]:
-        yield from self._get_many(and_(self.reminder_target.c.reminder_id == self.reminder.c.id,
-                                       after <= self.reminder.c.date,
-                                       self.reminder.c.date < before))
+    async def delete_reminder(self, event_id: EventID):
+        await self.db.execute(
+            """
+            DELETE FROM reminder WHERE event_id = $1
+        """,
+            event_id
+        )
 
-    def insert(self, reminder: ReminderInfo) -> None:
-        with self.db.begin() as tx:
-            res = tx.execute(self.reminder.insert()
-                             .values(date=reminder.date, room_id=reminder.room_id,
-                                     event_id=reminder.event_id, message=reminder.message,
-                                     reply_to=reminder.reply_to))
-            reminder.id = res.inserted_primary_key[0]
-            tx.execute(self.reminder_target.insert(),
-                       [{"reminder_id": reminder.id, "user_id": user_id,
-                         "event_id": event_id}
-                        for user_id, event_id in reminder.users.items()])
+    async def reschedule_reminder(self, start_time: datetime, event_id: EventID):
+        await self.db.execute(
+            """
+            UPDATE reminder SET start_time=$1 WHERE event_id=$2
+        """,
+            start_time.replace(microsecond=0).isoformat(),
+            event_id
+        )
+    async def update_room_id(self, old_id: RoomID, new_id: RoomID) -> None:
+        await self.db.execute("""
+            UPDATE reminder
+            SET room_id = $1
+            WHERE room_id = $2
+        """,
+            new_id,
+            old_id)
 
-    def update_room_id(self, old: RoomID, new: RoomID) -> None:
-        self.db.execute(self.reminder.update()
-                        .where(self.reminder.c.room_id == old)
-                        .values(room_id=new))
+    async def add_subscriber(self, reminder_id: EventID, user_id: UserID, subscribing_event: EventID) -> None:
+        await self.db.execute("""
+        INSERT INTO reminder_target (event_id, user_id, subscribing_event) VALUES ($1, $2, $3)
+        """,
+            reminder_id,
+            user_id,
+            subscribing_event)
 
-    def redact_event(self, event_id: EventID) -> None:
-        self.db.execute(self.reminder_target.delete()
-                        .where(self.reminder_target.c.event_id == event_id))
+    async def remove_subscriber(self, subscribing_event: EventID):
+        """Remove a user's subscription from a reminder"""
+        await self.db.execute("""
+        DELETE FROM reminder_target WHERE subscribing_event = $1
+        """,
+            subscribing_event
+        )
 
-    def add_user(self, reminder: ReminderInfo, user_id: UserID, event_id: EventID) -> bool:
-        if user_id in reminder.users:
-            return False
-        self.db.execute(self.reminder_target.insert()
-                        .values(reminder_id=reminder.id, user_id=user_id, event_id=event_id))
-        if isinstance(reminder.users, list):
-            reminder.users.append(user_id)
-        elif isinstance(reminder.users, dict):
-            reminder.users[user_id] = event_id
-        return True
-
-    def remove_user(self, reminder: ReminderInfo, user_id: UserID) -> bool:
-        if user_id not in reminder.users:
-            return False
-        self.db.execute(self.reminder_target.delete().where(
-            and_(self.reminder_target.c.reminder_id == reminder.id,
-                 self.reminder_target.c.user_id == user_id)))
-        reminder.users.remove(user_id)
-        return True
+    async def set_confirmation_event(self, event_id: EventID, confirmation_event: EventID):
+        await self.db.execute("""
+            UPDATE reminder
+            SET confirmation_event = $1
+            WHERE event_id = $2
+        """,
+            confirmation_event,
+            event_id)

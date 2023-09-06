@@ -1,6 +1,6 @@
 maubot: 0.4.1
-id: xyz.maubot.reminder
-version: 0.2.2
+id: org.bytemarx.reminder
+version: 0.1.0
 license: AGPL-3.0-or-later
 modules:
 - reminder
@@ -8,6 +8,12 @@ main_class: ReminderBot
 extra_files:
 - base-config.yaml
 dependencies:
-- python-dateutil
 - pytz
+- dateparser
+- apscheduler
+soft_dependencies:
+- cron_descriptor
+- arrow
 database: true
+database_type: asyncpg
+

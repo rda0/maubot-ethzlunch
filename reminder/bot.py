@@ -1,4 +1,4 @@
-# reminder - A maubot plugin to remind you about things.
+# reminder - A maubot plugin to create_reminder you about things.
 # Copyright (C) 2020 Tulir Asokan
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,273 +13,412 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import Type, Tuple, List
+import re
+from typing import Type, Tuple, List, Dict
 from datetime import datetime, timedelta
-from html import escape
-import asyncio
-
 import pytz
 
 from mautrix.types import (EventType, RedactionEvent, StateEvent, Format, MessageType,
-                           TextMessageEventContent, ReactionEvent, UserID)
-from mautrix.util.config import BaseProxyConfig
-from mautrix.util import background_task
+                           TextMessageEventContent, ReactionEvent, UserID, EventID, RelationType)
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command, event
+from mautrix.util.async_db import UpgradeTable
+from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
+from .migrations import upgrade_table
 from .db import ReminderDatabase
-from .util import Config, ReminderInfo, DateArgument, parse_timezone, format_time
-from .locales import locales
+from .util import validate_locale, validate_timezone, CommandSyntaxError, parse_date, CommandSyntax
+from .reminder import Reminder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# TODO: merge licenses
+
+class Config(BaseProxyConfig):
+    def do_update(self, helper: ConfigUpdateHelper) -> None:
+        helper.copy("default_timezone")
+        helper.copy("default_locale")
+        helper.copy("base_command")
+        helper.copy("agenda_command")
+        helper.copy("rate_limit_minutes")
+        helper.copy("rate_limit")
+        helper.copy("verbose")
+        helper.copy("admin_power_level")
 
 class ReminderBot(Plugin):
-    db: ReminderDatabase
-    reminder_loop_task: asyncio.Future
     base_command: str
     base_aliases: Tuple[str, ...]
+    agenda_command: Tuple[str, ...]
     default_timezone: pytz.timezone
+    scheduler: AsyncIOScheduler
+    reminders: Dict[EventID, Reminder]
+    db: ReminderDatabase
 
     @classmethod
     def get_config_class(cls) -> Type[BaseProxyConfig]:
         return Config
 
+    @classmethod
+    def get_db_upgrade_table(cls) -> UpgradeTable:
+        return upgrade_table
+
+
+
     async def start(self) -> None:
-        self.on_external_config_update()
+        self.scheduler = AsyncIOScheduler()
+        # self.scheduler.configure({"apscheduler.timezone": self.config["default_timezone"]})
+        self.scheduler.start()
         self.db = ReminderDatabase(self.database)
-        self.reminder_loop_task = asyncio.create_task(self.reminder_loop())
+        self.on_external_config_update()
+        # load all reminders
+        self.reminders = await self.db.load_all(self)
 
     def on_external_config_update(self) -> None:
         self.config.load_and_update()
         bc = self.config["base_command"]
+        ac = self.config["agenda_command"]
         self.base_command = bc[0] if isinstance(bc, list) else bc
         self.base_aliases = tuple(bc) if isinstance(bc, list) else (bc,)
-        raw_timezone = self.config["default_timezone"]
-        try:
-            self.default_timezone = pytz.timezone(raw_timezone)
-        except pytz.UnknownTimeZoneError:
-            self.log.warning(f"Unknown default timezone {raw_timezone}")
-            self.default_timezone = pytz.UTC
+        self.agenda_command = tuple(ac) if isinstance(ac, list) else (ac,)
+
+        # If the locale or timezone is invalid, use default one
+        self.db.defaults.locale = self.config["default_locale"]
+        if not validate_locale(self.config["default_locale"]):
+            self.log.warning(f'unknown default locale: {self.config["default_locale"]}')
+            self.db.defaults.locale = "en"
+        self.db.defaults.timezone = self.config["default_timezone"]
+        if not validate_timezone(self.config["default_timezone"]):
+            self.log.warning(f'unknown default timezone: {self.config["default_timezone"]}')
+            self.db.defaults.timezone = "UTC"
+
 
     async def stop(self) -> None:
-        self.reminder_loop_task.cancel()
+        self.scheduler.shutdown(wait=False)
 
-    async def reminder_loop(self) -> None:
-        try:
-            self.log.debug("Reminder loop started")
-            while True:
-                now = datetime.now(tz=pytz.UTC)
-                next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-                await asyncio.sleep((next_minute - now).total_seconds())
-                await self.schedule_nearby_reminders(next_minute)
-        except asyncio.CancelledError:
-            self.log.debug("Reminder loop stopped")
-        except Exception:
-            self.log.exception("Exception in reminder loop")
 
-    async def schedule_nearby_reminders(self, now: datetime) -> None:
-        until = now + timedelta(minutes=1)
-        for reminder in self.db.all_in_range(now, until):
-            background_task.create(self.send_reminder(reminder))
-
-    async def send_reminder(self, reminder: ReminderInfo) -> None:
-        try:
-            await self._send_reminder(reminder)
-        except Exception:
-            self.log.exception("Failed to send reminder")
-
-    async def _send_reminder(self, reminder: ReminderInfo) -> None:
-        if len(reminder.users) == 0:
-            self.log.debug(f"Cancelling reminder {reminder}, no users left to remind")
-            return
-        wait = (reminder.date - datetime.now(tz=pytz.UTC)).total_seconds()
-        if wait > 0:
-            self.log.debug(f"Waiting {wait} seconds to send {reminder}")
-            await asyncio.sleep(wait)
-        else:
-            self.log.debug(f"Sending {reminder} immediately")
-        users = " ".join(reminder.users)
-        users_html = " ".join(f"<a href='https://matrix.to/#/{user_id}'>{user_id}</a>"
-                              for user_id in reminder.users)
-        content = TextMessageEventContent(
-            msgtype=MessageType.TEXT, body=f"{users}: {reminder.message}", format=Format.HTML,
-            formatted_body=f"{users_html}: {escape(reminder.message)}")
-        content["xyz.maubot.reminder"] = {
-            "id": reminder.id,
-            "message": reminder.message,
-            "targets": list(reminder.users),
-            "reply_to": reminder.reply_to,
-        }
-        if reminder.reply_to:
-            content.set_reply(await self.client.get_event(reminder.room_id, reminder.reply_to))
-        await self.client.send_message(reminder.room_id, content)
 
     @command.new(name=lambda self: self.base_command,
-                 aliases=lambda self, alias: alias in self.base_aliases,
+                 aliases=lambda self, alias: alias in self.base_aliases + self.agenda_command,
                  help="Create a reminder", require_subcommand=False, arg_fallthrough=False)
-    @DateArgument("date", required=True)
+    @command.argument("room", matches="room", required=False)
+    @command.argument("every", matches="every", required=False)
+    @command.argument("start_time", matches="(.*?);", pass_raw=True, required=False)
+    @command.argument("cron", matches="cron ?(?:\s*\S*){0,5}", pass_raw=True, required=False)
     @command.argument("message", pass_raw=True, required=False)
-    async def remind(self, evt: MessageEvent, date: datetime, message: str) -> None:
-        date = date.replace(microsecond=0)
-        now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
-        if date < now:
-            await evt.reply(f"Sorry, {date} is in the past and I don't have a time machine :(")
-            return
-        rem = ReminderInfo(date=date, room_id=evt.room_id, message=message,
-                           reply_to=evt.content.get_reply_to(), users={evt.sender: evt.event_id})
-        await self._remind(evt, rem, now)
-
-    @remind.subcommand("reschedule", help="Reschedule a reminder you got", aliases=("again",))
-    @DateArgument("date", required=True)
-    async def reschedule(self, evt: MessageEvent, date: datetime) -> None:
+    async def create_reminder(self, evt: MessageEvent,
+                              room: str = None,
+                              every: str = None,
+                              start_time: Tuple[str] = None,
+                              cron: Tuple[str] = None,
+                              message: str = None,
+                              again: bool = False) -> None:
+        """Create a reminder or an alarm with a given target
+        Args:
+            evt:
+            room:
+            cron:
+            every:
+            start_time:
+            message:
+            again:
+        """
+        date_str = None
         reply_to_id = evt.content.get_reply_to()
-        if not reply_to_id:
-            await evt.reply("You must reply to a reminder event to reschedule it.")
-            return
-        date = date.replace(microsecond=0)
-        now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
-        if date < now:
-            await evt.reply(f"Sorry, {date} is in the past and I don't have a time machine :(")
-            return
-        reply_to = await self.client.get_event(evt.room_id, reply_to_id)
+        user_info = await self.db.get_user_info(evt.sender)
+        # Determine is the agenda command was used instead of creating a subcommand so [room] can still be used
+        agenda = evt.content.body[1:].startswith(self.agenda_command)
+        if agenda:
+            # Use the date the message was created as the date for agenda items
+            start_time = datetime.now(tz=pytz.UTC)
+
+        # If we are replying to a previous reminder, recreate the original reminder with a new time
+        if reply_to_id:
+            reply_to = await self.client.get_event(room_id=evt.room_id, event_id=reply_to_id)
+            if "org.bytemarx.reminder" in reply_to.content:
+                again = True
+                start_time = (message,)
+                message = reply_to.content["org.bytemarx.reminder"]["message"]
+                reply_to_id = reply_to.content["org.bytemarx.reminder"]["reply_to"]
+                event_id = reply_to.content["org.bytemarx.reminder"]["id"]
+                if event_id in self.reminders:
+                    await self.reminders[event_id].cancel()
+
         try:
-            reminder_info = reply_to.content["xyz.maubot.reminder"]
-            rem = ReminderInfo(date=date, room_id=evt.room_id, message=reminder_info["message"],
-                               reply_to=reminder_info["reply_to"], users={evt.sender: evt.event_id})
-        except KeyError:
-            await evt.reply("That doesn't look like a valid reminder event.")
-            return
-        await self._remind(evt, rem, now, again=True)
+            if not cron and not agenda:
+                if start_time:
+                    start_time, date_str = parse_date(start_time[0], user_info)
+                elif message.strip(): # extract the date from the message if not explicitly given
+                    start_time, date_str = parse_date(message, user_info, search_text=True)
 
-    async def _remind(self, evt: MessageEvent, rem: ReminderInfo, now: datetime, again: bool = False
-                      ) -> None:
-        if rem.date == now:
-            await self.send_reminder(rem)
+                    # Check if "every" appears immediately before the date, if so, the reminder should be recurring.
+                    # This makes "every" possible to use in a sentence instead of just with @command.argument("every")
+                    if not every:
+                        every = message.lower().find('every ' + date_str.lower()) >= 0
+
+                    # Remove the date from the messages, converting "buy ice cream on monday" to "buy ice cream"
+                    compiled = re.compile("(every )?" + re.escape(date_str), re.IGNORECASE)
+                    message = compiled.sub("", message,  1).strip()
+
+                else: # If no arguments are supplied, return the help message
+                    await evt.reply(self._help_message())
+                    return
+            reminder = Reminder(
+                bot=self,
+                room_id=evt.room_id,
+                message=message,
+                event_id=evt.event_id,
+                reply_to=reply_to_id,
+                start_time=start_time,
+                cron_tab=cron,
+                recur_every=date_str if every else None,
+                is_agenda=agenda,
+                creator=evt.sender,
+                user_info=user_info,
+            )
+
+        except CommandSyntaxError as e:
+            await evt.reply(e.message)
             return
-        remind_type = "remind you "
-        if rem.reply_to:
-            evt_link = f"[event](https://matrix.to/#/{rem.room_id}/{rem.reply_to})"
-            if rem.message:
-                remind_type += f"to {rem.message} (replying to that {evt_link})"
-            else:
-                remind_type += f"about that {evt_link}"
-        elif rem.message:
-            remind_type += f"to {rem.message}"
+
+        # Record the reminder and subscribe to it
+        await self.db.store_reminder(reminder)
+
+        # If the command was called with a "room_command", make the reminder ping the room
+        user_id = UserID("@room") if room else evt.sender
+        await reminder.add_subscriber(subscribing_event=evt.event_id, user_id=user_id)
+
+        # Send a message to the room confirming the creation of the reminder
+        await self.confirm_reminder(evt, reminder, again=again, agenda=agenda)
+
+        self.reminders[reminder.event_id] = reminder
+
+
+    async def confirm_reminder(self, evt: MessageEvent, reminder: Reminder, again: bool = False, agenda: bool = False):
+        """Sends a message to the room confirming the reminder is set
+        If verbose is set in the config, print out the full message. If false, just react with 👍
+
+        Args:
+            evt:
+            reminder: The Reminder to confirm
+            again: Is this a reminder that was rescheduled?
+            agenda: Is this an agenda instead of a reminder?
+        """
+        if self.config["verbose"]:
+
+            action = "add this to the agenda for" if agenda else "remind" if reminder.message else "ping"
+            target = "the room" if "@room" in reminder.subscribed_users.values() else "you"
+            message = f"to {reminder.message}" if reminder.message else ""
+
+            if reminder.reply_to:
+                evt_link = f"[message](https://matrix.to/#/{reminder.room_id}/{reminder.reply_to})"
+                message += f" (replying to that {evt_link})" if reminder.message else f" about that {evt_link}"
+
+            msg = f"I'll {action} {target} {message}"
+            msg += " again" if again else ""
+
+            if again:
+                msg += " again"
+            if not agenda:
+                formatted_time = reminder.formatted_time(await self.db.get_user_info(evt.sender))
+                msg += " " + formatted_time
+
+
+            confirmation_event = await evt.reply(f"{msg}\n\n"
+                            f"(others can \U0001F44D the message above to get pinged too)")
         else:
-            remind_type = "ping you"
-            rem.message = "ping"
-        if again:
-            remind_type += " again"
-        msg = (f"I'll {remind_type} {self.format_time(evt.sender, rem)}.\n\n"
-               f"(others can \U0001F44D this message to get pinged too)")
-        rem.event_id = await evt.reply(msg)
-        self.db.insert(rem)
-        now = datetime.now(tz=pytz.UTC)
-        if (rem.date - now).total_seconds() < 60 and now.minute == rem.date.minute:
-            self.log.debug(f"Reminder {rem} is in less than a minute, scheduling now...")
-            background_task.create(self.send_reminder(rem))
+            confirmation_event = await evt.react("\U0001F44D")
+        await reminder.set_confirmation(confirmation_event)
 
-    @remind.subcommand("help", help="Usage instructions")
+
+    # @command.new("cancel", help="Cancel a recurring reminder", aliases=("delete",))
+    @create_reminder.subcommand("cancel", help="Cancel a recurring reminder", aliases=("delete",))
+    @command.argument("search_text", pass_raw=True, required=False)
+    async def cancel_reminder(self, evt: MessageEvent, search_text: str) -> None:
+        """Cancel a reminder by replying to a reminder, or searching by either message or event ID"""
+
+        reminder = []
+        if evt.content.get_reply_to():
+            reminder_message = await self.client.get_event(evt.room_id, evt.content.get_reply_to())
+            if "org.bytemarx.reminder" not in reminder_message.content:
+                await evt.reply("That doesn't look like a valid reminder event.")
+                return
+            reminder = self.reminders[reminder_message.content["org.bytemarx.reminder"]["id"]]
+        elif search_text:
+            # First, check the reminders created by the user, then everything else
+            for rem in sorted(self.reminders.values(), key=lambda x: x.creator == evt.sender, reverse=True):
+                # Using the first four base64 digits of the hash, p(collision) > 0.01 at ~10000 reminders
+                if rem.event_id[1:5] == search_text or re.match(re.escape(search_text.strip()), rem.message.strip(), re.IGNORECASE):
+                # if rem.event_id[1:5] == search_text or rem.message.upper().strip() == search_text.upper().strip():
+                    reminder = rem
+                    break
+        else: # Display the help message
+            await evt.reply(CommandSyntax.REMINDER_CANCEL.value)
+            return
+
+        if not reminder:
+            await evt.reply(f"It doesn't look like you have any reminders matching the text `{search_text}`")
+            return
+
+        power_levels = await self.client.get_state_event(room_id=reminder.room_id,event_type=EventType.ROOM_POWER_LEVELS)
+        user_power = power_levels.users.get(evt.sender, power_levels.users_default)
+
+        if reminder.creator == evt.sender or user_power >= self.config["admin_power_level"]:
+            await reminder.cancel()
+            await evt.reply("Reminder cancelled!") if self.config["verbose"] else await evt.react("👍")
+        else:
+            await evt.reply(f"Power levels of {self.config['admin_power_level']} are required to cancel other people's reminders")
+
+
+    @create_reminder.subcommand("help", help="Usage instructions")
     async def help(self, evt: MessageEvent) -> None:
-        await evt.reply(f"Maubot [Reminder](https://github.com/maubot/reminder) plugin.\n\n"
-                        f"* !{self.base_command} <date> <message> - Add a reminder\n"
-                        f"* !{self.base_command} again <date> - Reply to a reminder to reschedule it\n"
-                        f"* !{self.base_command} list - Get a list of your reminders\n"
-                        f"* !{self.base_command} tz <timezone> - Set your time zone\n"
-                        f"* !{self.base_command} locale <locale> - Set your locale\n"
-                        f"* !{self.base_command} locales - List available locales\n\n"
-                        "<date> can be a time delta (e.g. `2 days 1.5 hours` or `friday at 15:00`) "
-                        "or an absolute date (e.g. `2020-03-27 15:00`)\n\n"
-                        "To get mentioned by a reminder added by someone else, upvote the message "
-                        "by reacting with \U0001F44D.\n\n"
-                        "To cancel a reminder, remove the message or reaction.")
+        await evt.reply(self._help_message(), allow_html=True)
 
-    @remind.subcommand("list", help="List your reminders")
-    @command.argument("all", required=False)
-    async def list(self, evt: MessageEvent, all: str) -> None:
-        room_id = evt.room_id
-        if "all" in all:
-            room_id = None
 
-        def format_rem(rem: ReminderInfo) -> str:
-            if rem.reply_to:
-                evt_link = f"[event](https://matrix.to/#/{rem.room_id}/{rem.reply_to})"
-                if rem.message:
-                    return f'"{rem.message}" (replying to {evt_link})'
+    @create_reminder.subcommand("list", help="List your reminders")
+    @command.argument("my", parser=lambda x: (re.sub(r"\bmy\b", "", x), re.search(r"\bmy\b", x)), required=False, pass_raw=True) # I hate it but it makes arguments not positional
+    @command.argument("subscribed", parser=lambda x: (re.sub(r"\bsubscribed\b", "", x), re.search(r"\bsubscribed\b", x)), required=False, pass_raw=True)
+    @command.argument("all", parser=lambda x: (re.sub(r"\ball\b", "", x), re.search(r"\ball\b", x)), required=False, pass_raw=True)
+    async def list(self, evt: MessageEvent, all: str, subscribed: str, my: str) -> None:
+        """Print out a formatted list of all the reminders for a user
+
+        Args:
+            evt: message event
+            my:  only list reminders the user created
+            all: list all reminders in every room
+            subscribed: only list reminders the user is subscribed to
+        """
+        room_id = None if all else evt.room_id
+        user_info = await self.db.get_user_info(evt.sender)
+        categories = {"**📜 Agenda items**": [], '**📅 Cron reminders**': [], '**🔁 Repeating reminders**': [], '**1️⃣ One-time reminders**': []}
+
+        # Sort the reminders by their next run date and format as bullet points
+        for reminder in sorted(self.reminders.values(), key=lambda x: x.job.next_run_time if x.job else datetime(2000,1,1,tzinfo=pytz.UTC)):
+            if (
+                    (not subscribed or any(x in reminder.subscribed_users.values() for x in [evt.sender, "@room"])) and
+                    (not my or evt.sender == reminder.creator) and
+                    (all or reminder.room_id == room_id)):
+
+                message = reminder.message
+                next_run = reminder.formatted_time(user_info)
+                short_event_id = f"[`{reminder.event_id[1:5]}`](https://matrix.to/#/{reminder.room_id}/{reminder.event_id})"
+
+                if reminder.reply_to:
+                    evt_link = f"[event](https://matrix.to/#/{reminder.room_id}/{reminder.reply_to})"
+                    message = f'{message} (replying to {evt_link})' if message else evt_link
+
+                if reminder.cron_tab:
+                    category = "**📅 Cron reminders**"
+                elif reminder.recur_every:
+                    category = "**🔁 Repeating reminders**"
+                elif not reminder.is_agenda:
+                    category = "**1️⃣ One-time reminders**"
                 else:
-                    return evt_link
-            else:
-                return f'"{rem.message}"'
+                    category = "**📜 Agenda items**"
+                categories[category].append(f"* {short_event_id} {next_run}  **{message}**")
 
-        reminders_str = "\n".join(f"* {format_rem(reminder)} {self.format_time(evt.sender, reminder)}"
-                                  for reminder in self.db.all_for_user(evt.sender, room_id=room_id))
-        message = "upcoming reminders"
-        if room_id:
-            message += " in this room"
-        if len(reminders_str) == 0:
-            await evt.reply(f"You have no {message} :(")
-        else:
-            await evt.reply(f"Your {message}:\n\n{reminders_str}")
+        # Upack the nested dict into a flat list of reminders seperated by category
+        in_room_msg = " in this room" if room_id else ""
+        output = []
+        for category, reminders in categories.items():
+            if reminders:
+                output.append("\n" + category + in_room_msg)
+                for reminder in reminders:
+                    output.append(reminder)
+        output = "\n".join(output)
 
-    def format_time(self, sender: UserID, reminder: ReminderInfo) -> str:
-        return format_time(reminder.date.astimezone(self.db.get_timezone(sender)))
+        if not output:
+            output = f"You have no upcoming reminders{in_room_msg} :("
+        await evt.reply(output)
 
-    @remind.subcommand("locales", help="List available locales")
-    async def locales(self, evt: MessageEvent) -> None:
-        def _format_key(key: str) -> str:
-            language, country = key.split("_")
-            return f"{language.lower()}_{country.upper()}"
 
-        await evt.reply("Available locales:\n\n" +
-                        "\n".join(f"* `{_format_key(key)}` - {locale.name}"
-                                  for key, locale in locales.items()))
 
-    @staticmethod
-    def _fmt_locales(locale_ids: List[str]) -> str:
-        locale_names = [locales[id].name for id in locale_ids]
-        if len(locale_names) == 0:
-            return "unset"
-        elif len(locale_names) == 1:
-            return locale_names[0]
-        else:
-            return ", ".join(locale_names[:-1]) + " and " + locale_names[-1]
-
-    @remind.subcommand("locale", help="Set your locale")
+    @create_reminder.subcommand("locale", help="Set your locale")
     @command.argument("locale", required=False, pass_raw=True)
     async def locale(self, evt: MessageEvent, locale: str) -> None:
         if not locale:
-            await evt.reply(f"Your locale is {self._fmt_locales(self.db.get_locales(evt.sender))}")
+            await evt.reply(f"Your locale is `{(await self.db.get_user_info(evt.sender)).locale}`")
             return
-        locale_ids = [part.strip() for part in locale.lower().split(" ")]
-        for locale_id in locale_ids:
-            if locale_id not in locales:
-                await evt.reply(f"Locale `{locale_id}` is not supported")
-                return
-        self.db.set_locales(evt.sender, locale_ids)
-        await evt.reply(f"Set your locale to {self._fmt_locales(locale_ids)}")
+        if validate_locale(locale):
+            await self.db.set_user_info(evt.sender, key="locale", value=locale)
+            await evt.reply(f"Setting your locale to {locale}")
+        else:
+            await evt.reply(f"Unknown locale: `{locale}`\n\n"
+                            f"[Available locales](https://dateparser.readthedocs.io/en/latest/supported_locales.html)"
+                            f" (case sensitive)")
 
-    @remind.subcommand("timezone", help="Set your timezone", aliases=("tz",))
-    @command.argument("timezone", parser=parse_timezone, required=False)
+
+
+    @create_reminder.subcommand("timezone", help="Set your timezone", aliases=("tz",))
+    @command.argument("timezone", required=False, pass_raw=True)
     async def timezone(self, evt: MessageEvent, timezone: pytz.timezone) -> None:
         if not timezone:
-            await evt.reply(f"Your time zone is {self.db.get_timezone(evt.sender).zone}")
+            await evt.reply(f"Your timezone is `{(await self.db.get_user_info(evt.sender)).timezone}`")
             return
-        self.db.set_timezone(evt.sender, timezone)
-        await evt.reply(f"Set your timezone to {timezone.zone}")
+        if validate_timezone(timezone):
+            await self.db.set_user_info(evt.sender, key="timezone", value=timezone)
+            await evt.reply(f"Setting your timezone to {timezone}")
+        else:
+            await evt.reply(f"Unknown timezone: `{timezone}`\n\n"
+                            f"[Available timezones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)")
+
 
     @command.passive(regex=r"(?:\U0001F44D[\U0001F3FB-\U0001F3FF]?)",
                      field=lambda evt: evt.content.relates_to.key,
                      event_type=EventType.REACTION, msgtypes=None)
     async def subscribe_react(self, evt: ReactionEvent, _: Tuple[str]) -> None:
-        reminder = self.db.get_by_event_id(evt.content.relates_to.event_id)
+        """
+        Subscribe to a reminder by reacting with "👍"️
+        """
+        reminder_id = evt.content.relates_to.event_id
+        reminder = self.reminders.get(reminder_id)
         if reminder:
-            self.db.add_user(reminder, evt.sender, evt.event_id)
+            await reminder.add_subscriber(user_id=evt.sender, subscribing_event=evt.event_id)
+
 
     @event.on(EventType.ROOM_REDACTION)
     async def redact(self, evt: RedactionEvent) -> None:
-        self.db.redact_event(evt.redacts)
+        """Unsubscribe from a reminder by redacting the message"""
+        for key, reminder in self.reminders.items():
+            if evt.redacts in reminder.subscribed_users:
+                await reminder.remove_subscriber(subscribing_event=evt.redacts)
+
+                # If the reminder has no users left, cancel it
+                if not reminder.subscribed_users or reminder.event_id == evt.redacts:
+                    await reminder.cancel(redact_confirmation=True)
+                break
+
 
     @event.on(EventType.ROOM_TOMBSTONE)
     async def tombstone(self, evt: StateEvent) -> None:
-        if not evt.content.replacement_room:
-            return
-        self.db.update_room_id(evt.room_id, evt.content.replacement_room)
+        """If a room gets upgraded or replaced, move any reminders to the new room"""
+        if evt.content.replacement_room:
+            await self.db.update_room_id(old_id=evt.room_id, new_id=evt.content.replacement_room)
+
+    def _help_message(self) -> str:
+        return f"""
+**⏰ Maubot [Reminder](https://github.com/maubot/reminder) plugin**\\
+TLDR: `!remind every friday 3pm take out the trash` `!remind cancel take out the trash`\\
+All commands can be called with `!{"|".join(self.base_aliases)}`
+
+**Creating optionally recurring reminders:**
+{CommandSyntax.REMINDER_CREATE.value.format(base_command=self.base_command)}
+
+**Creating agenda items**
+{CommandSyntax.AGENDA_CREATE.value.format(agenda_command="|".join(self.agenda_command))}
+
+**Listing active reminders**
+{CommandSyntax.REMINDER_LIST.value.format(base_command=self.base_command)}
+
+**Deleting reminders**
+
+{CommandSyntax.REMINDER_CANCEL.value.format(base_command=self.base_command)}
+
+**Rescheduling**
+
+{CommandSyntax.REMINDER_RESCHEDULE.value.format(base_command=self.base_command)}
+
+**Settings**
+
+{CommandSyntax.REMINDER_SETTINGS.value.format(base_command=self.base_command,
+                                              default_tz=self.db.defaults.timezone,
+                                              default_locale=self.db.defaults.locale)}
+"""

@@ -1,1 +1,8 @@
 *.mbp
+*.pyc
+/.idea
+config.yaml
+bot.db
+bot.db-shm
+bot.db-wal
+config.yaml

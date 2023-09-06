@@ -1,9 +1,29 @@
 # Default timezone for users who did not set one.
-# This is parsed with pytz, so the usual format is Continent/City, e.g. Europe/Helsinki.
-default_timezone: 'UTC'
+# This is parsed with dateparser, so Continent/City, UTC offsets, and abbreviations should work.
+#  e.g. Europe/Helsinki, EET, +0300
+# See https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+default_timezone: America/Los_Angeles
+
+# Default locale/language compatible with dateparser
+# See https://dateparser.readthedocs.io/en/latest/supported_locales.html
+default_locale: en
 
 # Base command without the prefix (!).
 # If a list is provided, the first is the main name and the rest are aliases.
 base_command:
 - remind
-- reminder
+- remindme
+
+# Alias used to create an agenda items
+agenda_command:
+- agenda
+
+
+# If verbose is true, display full confirmation messages. If false, confirm by reacting with :thumbs-up:
+verbose: true
+
+# Rate limit for individual users, as the number of reminders allowed to fire in an interval
+rate_limit: 10
+rate_limit_minutes: 60
+
+admin_power_level: 50
