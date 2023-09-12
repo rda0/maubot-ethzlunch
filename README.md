@@ -22,7 +22,6 @@ This bot requires python libraries that aren't included in the official maubot d
 * [apscheduler](https://github.com/agronholm/apscheduler)
 * [dateparser](https://github.com/scrapinghub/dateparser)
 * [cron_descriptor](https://github.com/Salamek/cron-descriptor) (optional, shows cron reminders with natural language)
-* [arrow](https://github.com/arrow-py/arrow) (optional, allows more advanced displays of time ranges)
 
 Be sure to add them to the optional-requirements.txt file in [maubot](https://github.com/maubot/maubot) and build a new docker image with
 `docker build --tag maubot-for-reminders . -f Dockerfile`

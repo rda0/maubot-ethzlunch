@@ -14,6 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
+
+import re
+from itertools import islice
 from collections import deque
 
 from typing import Optional, Dict, List, Tuple, TYPE_CHECKING
@@ -28,12 +31,6 @@ from enum import Enum
 from maubot.client import MaubotMatrixClient
 from mautrix.types import UserID, RoomID, EventID
 from maubot.handlers.command import  ArgumentSyntaxError
-
-try:
-    import arrow
-    USE_ARROW = True
-except ImportError:
-    USE_ARROW = False
 
 if TYPE_CHECKING:
     from .reminder import Reminder
@@ -186,6 +183,7 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
 
     # Until dateparser makes it so locales can be used in the searcher, use this to get date order
     date_order = validate_locale(user_info.locale).info["date_order"]
+    date_str = str_with_time
 
     settings = {'TIMEZONE': user_info.timezone,
                 'TO_TIMEZONE': 'UTC',
@@ -194,13 +192,19 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
                 'RETURN_AS_TIMEZONE_AWARE': True}
 
     if search_text:
-        results = search_dates(str_with_time, languages=[user_info.locale.split('-')[0]], settings=settings)
-        if not results:
-            raise CommandSyntaxError("Unable to extract date from string", CommandSyntax.SEARCH_DATE_EXAMPLES)
-        date_str, date = results[0]
+        # dateparser.parse is more reliable than search_dates. If the date is at the beginning of the message,
+        # try dateparser.parse on the first 6 words and use the date from the longest sequence that successfully parses.
+        # If this doesn't work or the date isn't at the beginning of the string, fallback to search_dates
+        date = []
+        for i in islice(re.finditer(r"\S+", str_with_time), 6):
+            date = dateparser.parse(str_with_time[:i.end()], locales=[user_info.locale], settings=settings) or date
+        if not date:
+            results = search_dates(str_with_time, languages=[user_info.locale.split('-')[0]], settings=settings)
+            if not results:
+                raise CommandSyntaxError("Unable to extract date from string", CommandSyntax.SEARCH_DATE_EXAMPLES)
+            date_str, date = results[0]
     else:
         date = dateparser.parse(str_with_time, locales=[user_info.locale], settings=settings)
-        date_str = str_with_time
         if not date:
             raise CommandSyntaxError(f"The given time `{str_with_time}` is invalid.", CommandSyntax.PARSE_DATE_EXAMPLES)
 
@@ -220,7 +224,7 @@ def pluralize(val: int, unit: str) -> str:
 
 def format_time(time: datetime, user_info: UserInfo) -> str:
     """
-    Format time as something readable by humans. If arrow is installed use it.
+    Format time as something readable by humans.
     Args:
         time: datetime to format
         user_info: contains locale (if using arrow) and timezone
@@ -229,20 +233,11 @@ def format_time(time: datetime, user_info: UserInfo) -> str:
 
     """
     now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
-    delta = time - now
+    delta = abs(time - now)
 
-    # If the date is coming up in less than a week, print the duration instead of the date
-    if delta <= timedelta(days=7):
-        if USE_ARROW:
-            # Try using the locale with arrow, which isn't guaranteed to be valid because dateparser has more locales
-            try:
-                formatted_time = arrow.get(time).humanize(locale=user_info.locale.split('-')[0])
-            except ValueError:
-                formatted_time = arrow.get(time).humanize()
-        else:
+    # If the date is coming up in less than a week, print the two most significant figures of the duration
+    if abs(delta) <= timedelta(days=7):
             parts = []
-
-            relativedelta(now, time)
             if delta.days > 0:
                 parts.append(pluralize(delta.days, "day"))
             hours, seconds = divmod(delta.seconds, 60)
@@ -253,9 +248,12 @@ def format_time(time: datetime, user_info: UserInfo) -> str:
                 parts.append(pluralize(minutes, "minute"))
             if seconds > 0:
                 parts.append(pluralize(seconds, "second"))
-            if len(parts) == 1:
-                return "in " + parts[0]
-            return "in " + ", ".join(parts[:-1]) + f" and {parts[-1]}"
+
+            formatted_time = " and ".join(parts[0:2])
+            if time > now:
+                formatted_time = "in " + formatted_time
+            else:
+                formatted_time = formatted_time + " ago"
     else:
         formatted_time = time.astimezone(
             dateparser.utils.get_timezone_from_tz_string(user_info.timezone)).strftime(

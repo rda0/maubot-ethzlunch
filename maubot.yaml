@@ -1,6 +1,6 @@
 maubot: 0.4.1
 id: org.bytemarx.reminder
-version: 0.1.0
+version: 0.1.1
 license: AGPL-3.0-or-later
 modules:
 - reminder
@@ -13,7 +13,6 @@ dependencies:
 - apscheduler
 soft_dependencies:
 - cron_descriptor
-- arrow
 database: true
 database_type: asyncpg
 
