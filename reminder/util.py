@@ -197,7 +197,11 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
         # If this doesn't work or the date isn't at the beginning of the string, fallback to search_dates
         date = []
         for i in islice(re.finditer(r"\S+", str_with_time), 6):
-            date = dateparser.parse(str_with_time[:i.end()], locales=[user_info.locale], settings=settings) or date
+            extracted_date = dateparser.parse(str_with_time[:i.end()], locales=[user_info.locale], settings=settings)
+            if extracted_date:
+                date = extracted_date
+                date_str = str_with_time[:i.end()]
+
         if not date:
             results = search_dates(str_with_time, languages=[user_info.locale.split('-')[0]], settings=settings)
             if not results:
