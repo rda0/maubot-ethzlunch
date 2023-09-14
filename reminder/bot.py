@@ -27,7 +27,7 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from .migrations import upgrade_table
 from .db import ReminderDatabase
-from .util import validate_locale, validate_timezone, CommandSyntaxError, parse_date, CommandSyntax
+from .util import validate_locale, validate_timezone, CommandSyntaxError, parse_date, CommandSyntax, make_pill
 from .reminder import Reminder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -39,15 +39,16 @@ class Config(BaseProxyConfig):
         helper.copy("default_locale")
         helper.copy("base_command")
         helper.copy("agenda_command")
+        helper.copy("cancel_command")
         helper.copy("rate_limit_minutes")
         helper.copy("rate_limit")
         helper.copy("verbose")
         helper.copy("admin_power_level")
 
 class ReminderBot(Plugin):
-    base_command: str
-    base_aliases: Tuple[str, ...]
+    base_command: Tuple[str, ...]
     agenda_command: Tuple[str, ...]
+    cancel_command: Tuple[str, ...]
     default_timezone: pytz.timezone
     scheduler: AsyncIOScheduler
     reminders: Dict[EventID, Reminder]
@@ -73,12 +74,14 @@ class ReminderBot(Plugin):
         self.reminders = await self.db.load_all(self)
 
     def on_external_config_update(self) -> None:
+
         self.config.load_and_update()
-        bc = self.config["base_command"]
-        ac = self.config["agenda_command"]
-        self.base_command = bc[0] if isinstance(bc, list) else bc
-        self.base_aliases = tuple(bc) if isinstance(bc, list) else (bc,)
-        self.agenda_command = tuple(ac) if isinstance(ac, list) else (ac,)
+
+        def config_to_tuple(list_or_str: List | str):
+            return tuple(list_or_str) if isinstance(list_or_str, list) else (list_or_str,)
+        self.base_command = config_to_tuple(self.config["base_command"])
+        self.agenda_command = config_to_tuple(self.config["agenda_command"])
+        self.cancel_command = config_to_tuple(self.config["cancel_command"])
 
         # If the locale or timezone is invalid, use default one
         self.db.defaults.locale = self.config["default_locale"]
@@ -96,8 +99,8 @@ class ReminderBot(Plugin):
 
 
 
-    @command.new(name=lambda self: self.base_command,
-                 aliases=lambda self, alias: alias in self.base_aliases + self.agenda_command,
+    @command.new(name=lambda self: self.base_command[0],
+                 aliases=lambda self, alias: alias in self.base_command + self.agenda_command,
                  help="Create a reminder", require_subcommand=False, arg_fallthrough=False)
     @command.argument("room", matches="room", required=False)
     @command.argument("every", matches="every", required=False)
@@ -114,9 +117,9 @@ class ReminderBot(Plugin):
         """Create a reminder or an alarm with a given target
         Args:
             evt:
-            room:
-            cron:
-            every:
+            room: if true, ping the whole room
+            cron: crontab syntax
+            every: is the reminder recurring?
             start_time:
             message:
             again:
@@ -230,7 +233,9 @@ class ReminderBot(Plugin):
 
 
     # @command.new("cancel", help="Cancel a recurring reminder", aliases=("delete",))
-    @create_reminder.subcommand("cancel", help="Cancel a recurring reminder", aliases=("delete",))
+    @create_reminder.subcommand(name=lambda self: self.cancel_command[0],
+                                help="Cancel a recurring reminder",
+                                aliases=lambda self, alias: alias in self.cancel_command)
     @command.argument("search_text", pass_raw=True, required=False)
     async def cancel_reminder(self, evt: MessageEvent, search_text: str) -> None:
         """Cancel a reminder by replying to a reminder, or searching by either message or event ID"""
@@ -251,7 +256,9 @@ class ReminderBot(Plugin):
                     reminder = rem
                     break
         else: # Display the help message
-            await evt.reply(CommandSyntax.REMINDER_CANCEL.value)
+            await evt.reply(CommandSyntax.REMINDER_CANCEL.value.format(base_command=self.base_command[0],
+                                            cancel_command=self.cancel_command[0],
+                                            cancel_aliases="|".join(self.cancel_command)))
             return
 
         if not reminder:
@@ -313,7 +320,11 @@ class ReminderBot(Plugin):
                     category = "**1️⃣ One-time reminders**"
                 else:
                     category = "**📜 Agenda items**"
-                categories[category].append(f"* {short_event_id} {next_run}  **{message}**")
+
+                room_link = f"https://matrix.to/#/{reminder.room_id}" if all else ""
+                # creator_link = await make_pill(reminder.creator) if not my else ""
+
+                categories[category].append(f"* {short_event_id + room_link} {next_run}  **{message}**")
 
         # Upack the nested dict into a flat list of reminders seperated by category
         in_room_msg = " in this room" if room_id else ""
@@ -326,8 +337,10 @@ class ReminderBot(Plugin):
         output = "\n".join(output)
 
         if not output:
-            output = f"You have no upcoming reminders{in_room_msg} :("
-        await evt.reply(output)
+            await evt.reply(f"You have no upcoming reminders{in_room_msg} :(")
+
+        await evt.reply(output + f"\n\n`!{self.base_command[0]} list [all] [my] [subscribed]`\\"
+                                 f"\n`!{self.base_command[0]} {self.cancel_command[0]} [4-letter ID or start of message]`")
 
 
 
@@ -395,30 +408,32 @@ class ReminderBot(Plugin):
 
     def _help_message(self) -> str:
         return f"""
-**⏰ Maubot [Reminder](https://github.com/maubot/reminder) plugin**\\
-TLDR: `!remind every friday 3pm take out the trash` `!remind cancel take out the trash`\\
-All commands can be called with `!{"|".join(self.base_aliases)}`
+**⏰ Maubot [Reminder](https://github.com/MxMarx/reminder) plugin**\\
+TLDR: `!{self.base_command[0]} every friday 3pm take out the trash` `!{self.base_command[0]} {self.cancel_command[0]} take out the trash`
 
 **Creating optionally recurring reminders:**
-{CommandSyntax.REMINDER_CREATE.value.format(base_command=self.base_command)}
+{CommandSyntax.REMINDER_CREATE.value.format(base_command=self.base_command[0],
+                                            base_aliases="|".join(self.base_command))}
 
 **Creating agenda items**
 {CommandSyntax.AGENDA_CREATE.value.format(agenda_command="|".join(self.agenda_command))}
 
 **Listing active reminders**
-{CommandSyntax.REMINDER_LIST.value.format(base_command=self.base_command)}
+{CommandSyntax.REMINDER_LIST.value.format(base_command=self.base_command[0])}
 
 **Deleting reminders**
 
-{CommandSyntax.REMINDER_CANCEL.value.format(base_command=self.base_command)}
+{CommandSyntax.REMINDER_CANCEL.value.format(base_command=self.base_command[0],
+                                            cancel_command=self.cancel_command[0],
+                                            cancel_aliases="|".join(self.cancel_command))}
 
 **Rescheduling**
 
-{CommandSyntax.REMINDER_RESCHEDULE.value.format(base_command=self.base_command)}
+{CommandSyntax.REMINDER_RESCHEDULE.value.format(base_command=self.base_command[0])}
 
 **Settings**
 
-{CommandSyntax.REMINDER_SETTINGS.value.format(base_command=self.base_command,
+{CommandSyntax.REMINDER_SETTINGS.value.format(base_command=self.base_command[0],
                                               default_tz=self.db.defaults.timezone,
                                               default_locale=self.db.defaults.locale)}
 """

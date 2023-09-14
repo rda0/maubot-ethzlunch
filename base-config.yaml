@@ -14,9 +14,15 @@ base_command:
 - remind
 - remindme
 
-# Alias used to create an agenda items
+# subcommands used to create an agenda items
 agenda_command:
 - agenda
+- todo
+
+# subcommands used to cancel reminders
+cancel_command:
+- cancel
+- delete
 
 
 # If verbose is true, display full confirmation messages. If false, confirm by reacting with :thumbs-up:

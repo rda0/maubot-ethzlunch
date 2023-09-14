@@ -30,13 +30,12 @@ This is pretty easy to use with the [ansible deployment](https://github.com/span
 
 ## Usage
 ### Creating optionally recurring reminders:
-`!remind <message containing date>` Adds a reminder by extracting the date from the text
-* `!remind abolish closed-access journals at 3pm tomorrow`
+`!remind|remindme|r <date> <message>` Adds a reminder
 * `!remind 8 hours buy more pumpkins`
 * `!remind 2023-11-30 15:00 befriend rats`
-
-`!remind <date>; <message>` Bypasses text parsing by explicitly specifying the date
-* `!remind 2 days 4 hours; do something`
+* `!remind abolish closed-access journals at 3pm tomorrow`
+* `July 2`, `tuesday at 2pm`, `8pm`, `20 days`, `4d`, `2wk`, ...
+* Dates doesn't need to be at the beginning of the string, but parsing works better if they are.
 
 `!remind [room] [every] ...`
 * `[room]` pings the whole room
@@ -46,7 +45,7 @@ This is pretty easy to use with the [ansible deployment](https://github.com/span
 * `!remind cron 30 9 * * mon-fri do something` sets reminders for 9:30am, Monday through Friday.
 * `!remind cron` lists more examples
 
-You can also reply to any message with `!remind ...` to get reminded about that message.\\
+You can also reply to any message with `!remind ...` to get reminded about that message.\
 To get pinged by someone else's reminder, react to their message with 👍.
 
 ### Creating agenda items
@@ -59,10 +58,10 @@ To get pinged by someone else's reminder, react to their message with 👍.
 * `subscribed` lists only reminders you are subscribed to
 
 ### Deleting reminders
-Cancel reminders by removing the message creating it, unsubscribe by removing your upvote.\\
-Cancel recurring reminders by replying to the ping with `!remind cancel|delete` 
+Cancel reminders by removing the message creating it, unsubscribe by removing your upvote.\
+Cancel recurring reminders by replying with `!remind cancel|delete` 
 * `!remind cancel|delete <ID>` deletes a reminder matching the 4 letter ID shown by `list`
-* `!remind cancel|delete <message>` deletes a reminder *beginning with* <message>
+* `!remind cancel|delete <message>` deletes a reminder **beginning with** <message>
     * e.g. `!remind delete buy more` would delete the reminder `buy more pumpkins`
 
 ### Rescheduling

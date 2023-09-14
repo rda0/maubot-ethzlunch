@@ -40,13 +40,12 @@ logger = logging.getLogger(__name__)
 
 class CommandSyntax(Enum):
     REMINDER_CREATE = """
-`!{base_command} <message containing date>` Adds a reminder by extracting the date from the text
-* `!{base_command} abolish closed-access journals at 3pm tomorrow`
+`!{base_aliases} <date> <message>` Adds a reminder
 * `!{base_command} 8 hours buy more pumpkins`
 * `!{base_command} 2023-11-30 15:00 befriend rats`
-
-`!{base_command} <date>; <message>` Bypasses text parsing by explicitly specifying the date
-* `!{base_command} 2 days 4 hours; do something`
+* `!{base_command} abolish closed-access journals at 3pm tomorrow`
+* `July 2`, `tuesday at 2pm`, `8pm`, `20 days`, `4d`, `2wk`, ...
+* Dates doesn't need to be at the beginning of the string, but parsing works better if they are.
 
 `!{base_command} [room] [every] ...`
 * `[room]` pings the whole room
@@ -73,14 +72,14 @@ To get pinged by someone else's reminder, react to their message with 👍.
 
     REMINDER_CANCEL = """
 Cancel reminders by removing the message creating it, unsubscribe by removing your upvote.\\
-Cancel recurring reminders by replying to the ping with `!{base_command} cancel|delete` 
-* `!{base_command} cancel|delete <ID>` deletes a reminder matching the 4 letter ID shown by `list`
-* `!{base_command} cancel|delete <message>` deletes a reminder *beginning with* <message>
-    * e.g. `!remind delete buy more` would delete the reminder `buy more pumpkins`
+Cancel recurring reminders by replying with `!{base_command} {cancel_aliases}` 
+* `!{base_command} {cancel_aliases} <ID>` deletes a reminder matching the 4 letter ID shown by `list`
+* `!{base_command} {cancel_aliases} <message>` deletes a reminder **beginning with** <message>
+    * e.g. `!remind {cancel_command} buy more` would delete the reminder `buy more pumpkins`
 """
 
     REMINDER_RESCHEDULE = """
-Reminders can be rescheduled after they have fired by replying with `!{base_command} <new date>`
+Reminders can be rescheduled by replying to the ping with `!{base_command} <new_date>`
 """
 
     REMINDER_SETTINGS = """
@@ -90,11 +89,7 @@ Defaults are `{default_tz}` and `{default_locale}`
 * `!{base_command} locale [new-locale]` view or set your locale
 """
 
-    SEARCH_DATE_EXAMPLES = "Example: `abolish closed-access journals at 11am on wednesday`, `8 hours buy more pumpkins`, `2023-11-30 15:00 befriend rats`"
-    PARSE_DATE_EXAMPLES = "Examples: `Tuesday at noon`, `8 hours`, `2023-11-30 10:15 pm`"
-
-
-    "Cancel a reminder by either redacting the message, using `!cancel <message>`, or replying to a recurring reminder with `!cancel`"
+    PARSE_DATE_EXAMPLES = "Examples: `Tuesday at noon`, `2023-11-30 10:15 pm`, `July 2`, `6 hours`, `8pm`, `4d`, `2wk`"
 
     CRON_EXAMPLE = """
 ```
@@ -205,7 +200,7 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
         if not date:
             results = search_dates(str_with_time, languages=[user_info.locale.split('-')[0]], settings=settings)
             if not results:
-                raise CommandSyntaxError("Unable to extract date from string", CommandSyntax.SEARCH_DATE_EXAMPLES)
+                raise CommandSyntaxError("Unable to extract date from string", CommandSyntax.PARSE_DATE_EXAMPLES)
             date_str, date = results[0]
     else:
         date = dateparser.parse(str_with_time, locales=[user_info.locale], settings=settings)
