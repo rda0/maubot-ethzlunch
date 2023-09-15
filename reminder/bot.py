@@ -205,6 +205,8 @@ class ReminderBot(Plugin):
             again: Is this a reminder that was rescheduled?
             agenda: Is this an agenda instead of a reminder?
         """
+        confirmation_event = await evt.react("\U0001F44D")
+
         if self.config["verbose"]:
 
             action = "add this to the agenda for" if agenda else "remind" if reminder.message else "ping"
@@ -227,8 +229,7 @@ class ReminderBot(Plugin):
 
             confirmation_event = await evt.reply(f"{msg}\n\n"
                             f"(others can \U0001F44D the message above to get pinged too)")
-        else:
-            confirmation_event = await evt.react("\U0001F44D")
+
         await reminder.set_confirmation(confirmation_event)
 
 

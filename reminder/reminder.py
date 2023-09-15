@@ -125,13 +125,18 @@ class Reminder(object):
             logger.debug(f"User {self.creator} is rate limited skipping reminder: {self.message}")
         else:
             # Build the message with the format "(users to ping) ⬆️(link to the reminder): message text [next run]
+            # Note: ️using "⬆️" as a link seems to have trouble rendering in element for android, but "⬆" works and element on my PC still renders it as the emoji
             targets = list(self.subscribed_users.values())
             link = f"https://matrix.to/#/{self.room_id}/{self.event_id}"
             users = " ".join([(await make_pill(user_id=user_id, client=self.bot.client))
                                   for user_id in targets])
+
             body = f"{users}: [⬆]({link}) {self.message}"
+
             if self.recur_every or self.cron_tab:
-                body += f"\n\nReminding again {self.formatted_time(user_info)}"
+                body += f"\n\nReminding again {self.formatted_time(user_info)}." \
+                        f" Reply `!{self.bot.base_command[0]} {self.bot.cancel_command[0]}` to stop."
+
             # Warn the user before rate limiting happens
             if reminder_count == self.bot.config["rate_limit"]:
                 body += f"\n\n*You've reached the rate limit " \

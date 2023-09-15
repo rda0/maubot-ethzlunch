@@ -178,7 +178,9 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
 
     # Until dateparser makes it so locales can be used in the searcher, use this to get date order
     date_order = validate_locale(user_info.locale).info["date_order"]
-    date_str = str_with_time
+
+    # Replace "3w" with "3wk" to satisfy dateparser
+    str_with_time = re.sub(r"(\b\d+)\s?w\b", r"\1wk", str_with_time, count=1)
 
     settings = {'TIMEZONE': user_info.timezone,
                 'TO_TIMEZONE': 'UTC',
@@ -186,33 +188,32 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
                 'PREFER_DATES_FROM': 'future',
                 'RETURN_AS_TIMEZONE_AWARE': True}
 
-    if search_text:
-        # dateparser.parse is more reliable than search_dates. If the date is at the beginning of the message,
-        # try dateparser.parse on the first 6 words and use the date from the longest sequence that successfully parses.
-        # If this doesn't work or the date isn't at the beginning of the string, fallback to search_dates
-        date = []
-        for i in islice(re.finditer(r"\S+", str_with_time), 6):
-            extracted_date = dateparser.parse(str_with_time[:i.end()], locales=[user_info.locale], settings=settings)
-            if extracted_date:
-                date = extracted_date
-                date_str = str_with_time[:i.end()]
+    # dateparser.parse is more reliable than search_dates. If the date is at the beginning of the message,
+    # try dateparser.parse on the first 8 words and use the date from the longest sequence that successfully parses.
+    date = []
+    date_str = []
+    for i in reversed(list(islice(re.finditer(r"\S+", str_with_time), 8))):
+        extracted_date = dateparser.parse(str_with_time[:i.end()], locales=[user_info.locale], settings=settings)
+        if extracted_date:
+            date = extracted_date
+            date_str = str_with_time[:i.end()]
+            break
 
-        if not date:
-            results = search_dates(str_with_time, languages=[user_info.locale.split('-')[0]], settings=settings)
-            if not results:
-                raise CommandSyntaxError("Unable to extract date from string", CommandSyntax.PARSE_DATE_EXAMPLES)
-            date_str, date = results[0]
-    else:
-        date = dateparser.parse(str_with_time, locales=[user_info.locale], settings=settings)
-        if not date:
-            raise CommandSyntaxError(f"The given time `{str_with_time}` is invalid.", CommandSyntax.PARSE_DATE_EXAMPLES)
+    # If the above doesn't work or the date isn't at the beginning of the string, fallback to search_dates
+    if not date:
+        extracted_date = search_dates(str_with_time, languages=[user_info.locale.split('-')[0]], settings=settings)
+        if extracted_date:
+            date_str, date = extracted_date[0]
+
+    if not date:
+        raise CommandSyntaxError("Unable to extract date from string", CommandSyntax.PARSE_DATE_EXAMPLES)
 
     # Round datetime object to the nearest second for nicer display
     date = date.replace(microsecond=0)
 
     # Disallow times in the past
     if date < datetime.now(tz=pytz.UTC):
-        raise CommandSyntaxError(f"Sorry, `{date}` is in the past and I don't have a time machine (yet...)")
+        raise CommandSyntaxError(f"Sorry, `{format_time(date, user_info)}` is in the past and I don't have a time machine (yet...)")
 
     return date, date_str
 
