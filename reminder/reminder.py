@@ -203,17 +203,17 @@ class Reminder(object):
 
         """
         if self.is_agenda:
-            return format_time(self.start_time, user_info)
+            return format_time(self.start_time, user_info=user_info, time_format=self.bot.config['time_format'])
         else:
-            next_run = format_time(self.job.next_run_time, user_info)
+            next_run = format_time(self.job.next_run_time, user_info=user_info, time_format=self.bot.config['time_format'])
             if self.cron_tab:
                 # TODO add languages
                 if USE_CRON_DESCRIPTOR:
                     return f"{ExpressionDescriptor(self.cron_tab, casing_type=CasingTypeEnum.LowerCase)} (`{self.cron_tab}`), next run {next_run}"
                 else:
-                    return f"`{self.cron_tab}`, next run {next_run}"
+                    return f"`{self.cron_tab}`, next run at {next_run}"
             elif self.recur_every:
-                return f"every {self.recur_every}, next run {next_run}"
+                return f"every {self.recur_every}, next run at {next_run}"
             else: # once-off reminders
                 return next_run
 

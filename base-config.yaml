@@ -1,3 +1,6 @@
+# https://github.com/MxMarx/reminder
+# Feature requests welcome!
+
 # Default timezone for users who did not set one.
 # This is parsed with dateparser, so Continent/City, UTC offsets, and abbreviations should work.
 #  e.g. Europe/Helsinki, EET, +0300
@@ -14,7 +17,8 @@ base_command:
 - remind
 - remindme
 
-# subcommands used to create an agenda items
+# Agenda items are like reminders but don't have a time, for things like to-do lists.
+# Aliases used to create an agenda items by calling "!agenda <message>":
 agenda_command:
 - agenda
 - todo
@@ -24,7 +28,6 @@ cancel_command:
 - cancel
 - delete
 
-
 # If verbose is true, display full confirmation messages. If false, confirm by reacting with :thumbs-up:
 verbose: true
 
@@ -32,4 +35,11 @@ verbose: true
 rate_limit: 10
 rate_limit_minutes: 60
 
+# Power level needed to delete someone else's reminder
 admin_power_level: 50
+
+# time_format: strftime format when listing reminders.
+#   "%-I:%M%P %Z on %A, %B %-d %Y"  - 7:36pm PDT on Sunday, September 17 2023
+#   "%Y-%m-%d %H:%M %Z"             - 2023-09-17 19:36 PDT
+#   Currently, reminders within 7 days will be displayed as just the relative delta, e.g. "2 days and 1 hour"
+time_format: "%-I:%M%P %Z on %A, %B %-d %Y"

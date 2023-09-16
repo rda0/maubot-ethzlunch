@@ -222,13 +222,13 @@ def pluralize(val: int, unit: str) -> str:
         return f"{val} {unit}"
     return f"{val} {unit}s"
 
-def format_time(time: datetime, user_info: UserInfo) -> str:
+def format_time(time: datetime, user_info: UserInfo, time_format: str = "%-I:%M%P %Z on %A, %B %-d %Y") -> str:
     """
     Format time as something readable by humans.
     Args:
         time: datetime to format
-        user_info: contains locale (if using arrow) and timezone
-
+        user_info: contains locale and timezone
+        time_format:
     Returns:
 
     """
@@ -256,8 +256,7 @@ def format_time(time: datetime, user_info: UserInfo) -> str:
                 formatted_time = formatted_time + " ago"
     else:
         formatted_time = time.astimezone(
-            dateparser.utils.get_timezone_from_tz_string(user_info.timezone)).strftime(
-            "at %I:%M%P %Z on %A, %B %d %Y")
+            dateparser.utils.get_timezone_from_tz_string(user_info.timezone)).strftime(time_format)
     return formatted_time
 
 

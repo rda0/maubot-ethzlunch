@@ -44,6 +44,8 @@ class Config(BaseProxyConfig):
         helper.copy("rate_limit")
         helper.copy("verbose")
         helper.copy("admin_power_level")
+        helper.copy("time_format")
+
 
 class ReminderBot(Plugin):
     base_command: Tuple[str, ...]
