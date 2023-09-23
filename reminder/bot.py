@@ -122,13 +122,15 @@ class ReminderBot(Plugin):
             room: if true, ping the whole room
             cron: crontab syntax
             every: is the reminder recurring?
-            start_time:
-            message:
+            start_time: can be explicitly specified with a semicolon: !remind <start_time>; <message>
+            message: contains both the start_time and the message if not using a semicolon to separate them
             again:
         """
         date_str = None
         reply_to_id = evt.content.get_reply_to()
+        reply_to = None
         user_info = await self.db.get_user_info(evt.sender)
+
         # Determine is the agenda command was used instead of creating a subcommand so [room] can still be used
         agenda = evt.content.body[1:].startswith(self.agenda_command)
         if agenda:
@@ -166,6 +168,11 @@ class ReminderBot(Plugin):
                 else: # If no arguments are supplied, return the help message
                     await evt.reply(self._help_message())
                     return
+
+            # If the reminder was created by replying to a message, use that message's text
+            if reply_to_id and not message:
+                message = reply_to.content["body"]
+
             reminder = Reminder(
                 bot=self,
                 room_id=evt.room_id,
