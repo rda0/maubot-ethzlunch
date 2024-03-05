@@ -2,8 +2,11 @@
 
 A [maubot](https://github.com/maubot/maubot) plugin for the canteen lunch menus at ETH Zurich.
 
-Forked from [reminder-agenda bot](https://github.com/MxMarx/reminder), which is
-basically [matrix-reminder-bot](https://github.com/anoadragon453/matrix-reminder-bot/tree/master) and [maubot/reminder](https://github.com/maubot/reminder) smushed together. This project includes code taken from all repositories, credit goes to them!
+Maubot forked from [reminder-agenda bot](https://github.com/MxMarx/reminder), which is
+basically [matrix-reminder-bot](https://github.com/anoadragon453/matrix-reminder-bot/tree/master) and [maubot/reminder](https://github.com/maubot/reminder) smushed together.
+Extension of [lunch-menu-fetcher](https://gitlab.phys.ethz.ch/gabriema/lunch-menu-fetcher),
+which uses webhooks to post lunch menus to rooms.
+This project includes code taken from all repositories, credit goes to them!
 
 ## Features
 
