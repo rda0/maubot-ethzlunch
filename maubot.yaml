@@ -1,6 +1,6 @@
 maubot: 0.4.1
-id: org.bytemarx.reminder
-version: 0.1.2
+id: ch.ethz.phys.lunch
+version: 0.0.2
 license: AGPL-3.0-or-later
 modules:
 - reminder
@@ -15,4 +15,3 @@ soft_dependencies:
 - cron_descriptor
 database: true
 database_type: asyncpg
-

@@ -33,7 +33,6 @@ async def upgrade_v1(conn: Connection, scheme: Scheme) -> None:
             is_agenda   BOOL,                   /* agendas are alarms that don't trigger */
             confirmation_event TEXT,            /* event_id of the confirmation message, so that we can delete the confirmation if the reminder is deleted */
             PRIMARY KEY (event_id)
-            
         )"""
     )
 
@@ -52,6 +51,8 @@ async def upgrade_v1(conn: Connection, scheme: Scheme) -> None:
             user_id     VARCHAR(255) NOT NULL,  /* user_id */
             timezone    TEXT,                   /* user's timezone, e.g. America/Los_Angeles, PST. see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones */
             locale      TEXT,                   /* user's locale or langauge, e.g. en, en-AU, fr, fr-CA. See https://dateparser.readthedocs.io/en/latest/supported_locales.html */
+            price       TEXT,                   /* user's price category */
+            facilities  TEXT,                   /* user's facilities filter list */
             PRIMARY KEY (user_id)
         )"""
     )

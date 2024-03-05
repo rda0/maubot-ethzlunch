@@ -16,17 +16,16 @@
 from __future__ import annotations
 import logging
 
-from typing import Optional, Iterator, Dict, List, DefaultDict
+from typing import Dict, DefaultDict, Literal, TYPE_CHECKING
 from datetime import datetime
 from collections import defaultdict
-from .util import validate_timezone, validate_locale, UserInfo
+from .util import validate_timezone, validate_locale, validate_price, validate_facilities, UserInfo
 
 import pytz
 
 from mautrix.util.async_db import Database
 
 from mautrix.types import UserID, EventID, RoomID
-from typing import Dict, Literal, TYPE_CHECKING
 
 
 if TYPE_CHECKING:
@@ -48,20 +47,22 @@ class ReminderDatabase:
         self.cache = defaultdict()
         self.defaults = defaults
 
-
     async def get_user_info(self, user_id: UserID) -> UserInfo:
         """ Get the timezone and locale for a user. Data is cached in memory.
         Args:
             user_id: ID for the user to query
         Returns:
-            UserInfo: a dataclass with keys: 'locale' and 'timezone'
+            UserInfo: a dataclass with keys: 'locale', 'timezone', 'price' and 'facilities'
         """
         if user_id not in self.cache:
-            query = "SELECT timezone, locale FROM user_settings WHERE user_id = $1"
+            query = ("SELECT timezone, locale, price, facilities"
+                     " FROM user_settings WHERE user_id = $1")
             row = dict(await self.db.fetchrow(query, user_id) or {})
 
             locale = row.get("locale", self.defaults.locale)
             timezone = row.get("timezone", self.defaults.timezone)
+            price = row.get("price", self.defaults.price)
+            facilities = row.get("facilities", self.defaults.facilities)
 
             # If fetched locale is invalid, use default one
             if not locale or not validate_locale(locale):
@@ -71,19 +72,29 @@ class ReminderDatabase:
             if not timezone or not validate_timezone(timezone):
                 timezone = self.defaults.timezone
 
-            self.cache[user_id] = UserInfo(locale=locale, timezone=timezone)
+            if not price or not validate_price(price):
+                price = self.defaults.price
+
+            if not facilities or not validate_facilities(facilities):
+                facilities = self.defaults.facilities
+
+            self.cache[user_id] = UserInfo(locale=locale,
+                                           timezone=timezone,
+                                           price=price,
+                                           facilities=facilities)
 
         return self.cache[user_id]
 
-
-    async def set_user_info(self, user_id: UserID, key: Literal["timezone", "locale"], value: str) -> None:
+    async def set_user_info(self, user_id: UserID,
+                            key: Literal["timezone", "locale", "price", "facilities"],
+                            value: str) -> None:
         # Make sure user_info is populated first
         await self.get_user_info(user_id)
         # Update cache
         setattr(self.cache[user_id], key, value)
         # Update the db
         q = """
-        INSERT INTO user_settings (user_id, {0}) 
+        INSERT INTO user_settings (user_id, {0})
         VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET {0} = EXCLUDED.{0}
         """.format(key)
         await self.db.execute(q, user_id, value)
@@ -114,15 +125,30 @@ class ReminderDatabase:
             reminder.is_agenda,
             reminder.creator)
 
-
     async def load_all(self, bot: ReminderBot) -> Dict[EventID, Reminder]:
         """ Load all reminders in the database and return them as a dict for the main bot
         Args:
-            bot: it feels dirty to do it this way, but it seems to work and make code cleaner but feel free to fix this
+            bot: it feels dirty to do it this way, but it seems to work and make code cleaner
+                 but feel free to fix this
         Returns:
             a dict of Reminders, with the event id as the key.
         """
-        rows = await self.db.fetch("""
+        rows_reminders = await self.db.fetch("""
+                SELECT
+                    event_id,
+                    room_id,
+                    message,
+                    reply_to,
+                    start_time,
+                    recur_every,
+                    cron_tab,
+                    is_agenda,
+                    confirmation_event,
+                    creator
+                FROM reminder
+            """)
+
+        rows_subscribers = await self.db.fetch("""
                 SELECT
                     event_id,
                     room_id,
@@ -138,14 +164,33 @@ class ReminderDatabase:
                     creator
                 FROM reminder NATURAL JOIN reminder_target
             """)
-        logger.debug(f"Loaded {len(rows)} reminders")
+
+        logger.info(f"Loaded {len(rows_reminders)} reminders"
+                    f" with {len(rows_subscribers)} subscribers")
+
+        rows = rows_reminders + rows_subscribers
         reminders = {}
+
         for row in rows:
-            # Reminder subscribers are stored in a separate table instead of in an array type for sqlite support
-            if row["event_id"] in reminders:
-                # reminders[row["event_id"]].subscribed_users.append(row["user_id"])
-                reminders[row["event_id"]].subscribed_users[row["user_id"]] = row["subscribing_event"]
-                continue
+            if "user_id" in row.keys():
+                # If a row has the key `"user_id:` it is a subscriber.
+                # Reminder subscribers are stored in a separate table
+                # instead of in an array type for sqlite support.
+                # So we need to handle them here and add subscribers to reminders
+                if row["event_id"] in reminders:
+                    rid = row["event_id"]
+                    sid = row["subscribing_event"]
+                    uid = row["user_id"]
+                    # Reminders with already existing event_id in reminders are just subscribers
+                    reminders[rid].subscribed_users[sid] = uid
+                    # Reminder already exists
+                    continue
+
+                # New reminder with subscriber
+                subscribed_users = {row["subscribing_event"]: row["user_id"]}
+            else:
+                # New reminder without subscriber
+                subscribed_users = {}
 
             start_time = datetime.fromisoformat(row["start_time"]) if row["start_time"] else None
 
@@ -165,6 +210,8 @@ class ReminderDatabase:
                         await self.delete_reminder(row["event_id"])
                         continue
 
+            logger.info(f"load reminder: {row['event_id']}")
+
             reminders[row["event_id"]] = Reminder(
                 bot=bot,
                 event_id=row["event_id"],
@@ -175,9 +222,9 @@ class ReminderDatabase:
                 recur_every=row["recur_every"],
                 cron_tab=row["cron_tab"],
                 is_agenda=row["is_agenda"],
-                subscribed_users={row["subscribing_event"]: row["user_id"]},
+                subscribed_users=subscribed_users,
                 creator=row["creator"],
-                user_info= await self.get_user_info(row["creator"]),
+                user_info=await self.get_user_info(row["creator"]),
                 confirmation_event=row["confirmation_event"],
             )
 
@@ -199,6 +246,7 @@ class ReminderDatabase:
             start_time.replace(microsecond=0).isoformat(),
             event_id
         )
+
     async def update_room_id(self, old_id: RoomID, new_id: RoomID) -> None:
         await self.db.execute("""
             UPDATE reminder

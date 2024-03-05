@@ -19,7 +19,7 @@ import re
 from itertools import islice
 from collections import deque
 
-from typing import Optional, Dict, List, Tuple, TYPE_CHECKING
+from typing import Tuple
 from datetime import datetime, timedelta
 from attr import dataclass
 from dateparser.search import search_dates
@@ -29,97 +29,22 @@ import pytz
 from enum import Enum
 
 from maubot.client import MaubotMatrixClient
-from mautrix.types import UserID, RoomID, EventID
-from maubot.handlers.command import  ArgumentSyntaxError
-
-if TYPE_CHECKING:
-    from .reminder import Reminder
+from mautrix.types import UserID
 
 logger = logging.getLogger(__name__)
 
 
 class CommandSyntax(Enum):
-    REMINDER_CREATE = """
-`!{base_aliases} <date> <message>` Adds a reminder
-* `!{base_command} 8 hours buy more pumpkins`
-* `!{base_command} 2023-11-30 15:00 befriend rats`
-* `!{base_command} abolish closed-access journals at 3pm tomorrow`
-* `July 2`, `tuesday at 2pm`, `8pm`, `20 days`, `4d`, `2wk`, ...
-* Dates doesn't need to be at the beginning of the string, but parsing works better if they are.
-
-`!{base_command} [room] [every] ...`
-* `[room]` pings the whole room
-* `[every]` create recurring reminders `!{base_command} every friday 3pm take out the trash`
-
-`!{base_command} [room] <cron> <message>` Schedules a reminder using a crontab syntax
-* `!{base_command} cron 30 9 * * mon-fri do something` sets reminders for 9:30am, Monday through Friday.
-* `!{base_command} cron` lists more examples
-
-You can also reply to any message with `!{base_command} ...` to get reminded about that message.\\
-To get pinged by someone else's reminder, react to their message with 👍.
-"""
-
-    AGENDA_CREATE = """
-`!{agenda_command} [room] <message>` creates an agenda item. Agenda items are like reminders but don't have a time, for things like to-do lists.
-    """
-
-    REMINDER_LIST = """
-`!{base_command} list [all] [my] [subscribed]` lists all reminders in a room 
-* `all` lists all reminders from every room
-* `my` lists only reminders you created
-* `subscribed` lists only reminders you are subscribed to
-    """
-
-    REMINDER_CANCEL = """
-Cancel reminders by removing the message creating it, unsubscribe by removing your upvote.\\
-Cancel recurring reminders by replying with `!{base_command} {cancel_aliases}` 
-* `!{base_command} {cancel_aliases} <ID>` deletes a reminder matching the 4 letter ID shown by `list`
-* `!{base_command} {cancel_aliases} <message>` deletes a reminder **beginning with** <message>
-    * e.g. `!remind {cancel_command} buy more` would delete the reminder `buy more pumpkins`
-"""
-
-    REMINDER_RESCHEDULE = """
-Reminders can be rescheduled by replying to the ping with `!{base_command} <new_date>`
-"""
-
-    REMINDER_SETTINGS = """
-Dates are parsed using your [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zone) and [locale](https://dateparser.readthedocs.io/en/latest/supported_locales.html).
-Defaults are `{default_tz}` and `{default_locale}`
-* `!{base_command} tz|timezone [new-timezone]` view or set your timezone
-* `!{base_command} locale [new-locale]` view or set your locale
-"""
-
     PARSE_DATE_EXAMPLES = "Examples: `Tuesday at noon`, `2023-11-30 10:15 pm`, `July 2`, `6 hours`, `8pm`, `4d`, `2wk`"
-
-    CRON_EXAMPLE = """
-```
-*	any value
-,	value list separator
--	range of values
-/	step 
-
-┌─────── minute (0 - 59)
-│ ┌─────── hour (0 - 23)
-│ │ ┌─────── day of the month (1 - 31)
-│ │ │ ┌─────── month (1 - 12)
-│ │ │ │ ┌─────── weekday (0 - 6) (Sunday to Saturday)                             
-│ │ │ │ │
-* * * * * <message>
-```
-
-```
-30 9 * * *              Every day at 9:30am
-0/30 9-17 * * mon-fri   Every 30 minutes from 9am to 5pm, Monday through Friday
-0 14 1,16 * *           2:00pm on the 1st and 16th day of the month
-0 0 1-7 * mon           First Monday of the month at midnight
-```
- """
+    CRON_EXAMPLE = "Valid weekday examples: `mon-fri`, `mon,tue,thu`, `mon-wed,fri`"
 
 
 @dataclass
 class UserInfo:
     locale: str = None
     timezone: str = None
+    price: str = None
+    facilities: str = None
     last_reminders: deque = deque()
 
     def check_rate_limit(self, max_calls=5, time_window=60) -> int:
@@ -138,6 +63,7 @@ class UserInfo:
             self.last_reminders.append(now)
         return len(self.last_reminders)
 
+
 class CommandSyntaxError(ValueError):
     def __init__(self, message: str, command: CommandSyntax | None = None):
         """ Format error messages with examples """
@@ -147,11 +73,13 @@ class CommandSyntaxError(ValueError):
             message += "\n\n" + command.value
         self.message = message
 
+
 def validate_timezone(tz: str) -> bool | str:
     try:
         return dateparser.utils.get_timezone_from_tz_string(tz).tzname(None)
     except pytz.UnknownTimeZoneError:
         return False
+
 
 def validate_locale(locale: str):
     try:
@@ -159,7 +87,16 @@ def validate_locale(locale: str):
     except ValueError:
         return False
 
-def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False) -> Tuple[datetime, str]:
+
+def validate_price(price: str) -> bool:
+    return price.lower() in ["int", "ext", "stud", "off"]
+
+
+def validate_facilities(facilities: str) -> bool:
+    return isinstance(facilities, str)
+
+
+def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool = False) -> Tuple[datetime, str]:
     """
     Extract the date from a string.
 
@@ -217,10 +154,12 @@ def parse_date(str_with_time: str, user_info: UserInfo, search_text: bool=False)
 
     return date, date_str
 
+
 def pluralize(val: int, unit: str) -> str:
     if val == 1:
         return f"{val} {unit}"
     return f"{val} {unit}s"
+
 
 def format_time(time: datetime, user_info: UserInfo, time_format: str = "%-I:%M%P %Z on %A, %B %-d %Y") -> str:
     """
@@ -237,23 +176,23 @@ def format_time(time: datetime, user_info: UserInfo, time_format: str = "%-I:%M%
 
     # If the date is coming up in less than a week, print the two most significant figures of the duration
     if abs(delta) <= timedelta(days=7):
-            parts = []
-            if delta.days > 0:
-                parts.append(pluralize(delta.days, "day"))
-            hours, seconds = divmod(delta.seconds, 60)
-            hours, minutes = divmod(hours, 60)
-            if hours > 0:
-                parts.append(pluralize(hours, "hour"))
-            if minutes > 0:
-                parts.append(pluralize(minutes, "minute"))
-            if seconds > 0:
-                parts.append(pluralize(seconds, "second"))
+        parts = []
+        if delta.days > 0:
+            parts.append(pluralize(delta.days, "day"))
+        hours, seconds = divmod(delta.seconds, 60)
+        hours, minutes = divmod(hours, 60)
+        if hours > 0:
+            parts.append(pluralize(hours, "hour"))
+        if minutes > 0:
+            parts.append(pluralize(minutes, "minute"))
+        if seconds > 0:
+            parts.append(pluralize(seconds, "second"))
 
-            formatted_time = " and ".join(parts[0:2])
-            if time > now:
-                formatted_time = "in " + formatted_time
-            else:
-                formatted_time = formatted_time + " ago"
+        formatted_time = " and ".join(parts[0:2])
+        if time > now:
+            formatted_time = "in " + formatted_time
+        else:
+            formatted_time = formatted_time + " ago"
     else:
         formatted_time = time.astimezone(
             dateparser.utils.get_timezone_from_tz_string(user_info.timezone)).strftime(time_format)
@@ -282,4 +221,3 @@ async def make_pill(user_id: UserID, display_name: str = None, client: MaubotMat
 
     # return f'<a href="https://matrix.to/#/{user_id}">{display_name}</a>'
     return f'[{display_name}](https://matrix.to/#/{user_id})'
-

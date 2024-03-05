@@ -1,4 +1,5 @@
-# reminder - A maubot plugin to create_reminder you about things.
+# ethzlunch - A maubot plugin for the canteen lunch menus at ETH Zurich.
+# Copyright (C) 2024 Sven Mäder
 # Copyright (C) 2020 Tulir Asokan
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,13 +14,11 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-import re
 from typing import Type, Tuple, List, Dict
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 import pytz
 
-from mautrix.types import (EventType, RedactionEvent, StateEvent, Format, MessageType,
-                           TextMessageEventContent, ReactionEvent, UserID, EventID, RelationType)
+from mautrix.types import (EventType, RedactionEvent, StateEvent, ReactionEvent, EventID)
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command, event
 from mautrix.util.async_db import UpgradeTable
@@ -27,34 +26,39 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from .migrations import upgrade_table
 from .db import ReminderDatabase
-from .util import validate_locale, validate_timezone, CommandSyntaxError, parse_date, CommandSyntax, make_pill
+from .util import validate_locale, validate_timezone, CommandSyntaxError
 from .reminder import Reminder
+from .ethz import (parse_facilities, parse_menus, filter_facilities, markdown_facilities,
+                   markdown_menus)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# TODO: merge licenses
 
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         helper.copy("default_timezone")
         helper.copy("default_locale")
         helper.copy("base_command")
-        helper.copy("agenda_command")
-        helper.copy("cancel_command")
+        helper.copy("hunger_command")
         helper.copy("rate_limit_minutes")
         helper.copy("rate_limit")
-        helper.copy("verbose")
         helper.copy("admin_power_level")
         helper.copy("time_format")
+        helper.copy("url_facilities")
+        helper.copy("url_menus")
+        helper.copy("default_price")
+        helper.copy("default_facilities")
 
 
 class ReminderBot(Plugin):
     base_command: Tuple[str, ...]
-    agenda_command: Tuple[str, ...]
-    cancel_command: Tuple[str, ...]
+    hunger_command: Tuple[str, ...]
     default_timezone: pytz.timezone
+    admin_power_level: int
     scheduler: AsyncIOScheduler
     reminders: Dict[EventID, Reminder]
     db: ReminderDatabase
+    url_facilities: str
+    url_menus: str
 
     @classmethod
     def get_config_class(cls) -> Type[BaseProxyConfig]:
@@ -64,26 +68,21 @@ class ReminderBot(Plugin):
     def get_db_upgrade_table(cls) -> UpgradeTable:
         return upgrade_table
 
-
-
     async def start(self) -> None:
         self.scheduler = AsyncIOScheduler()
-        # self.scheduler.configure({"apscheduler.timezone": self.config["default_timezone"]})
         self.scheduler.start()
         self.db = ReminderDatabase(self.database)
         self.on_external_config_update()
-        # load all reminders
         self.reminders = await self.db.load_all(self)
 
     def on_external_config_update(self) -> None:
-
         self.config.load_and_update()
 
         def config_to_tuple(list_or_str: List | str):
             return tuple(list_or_str) if isinstance(list_or_str, list) else (list_or_str,)
         self.base_command = config_to_tuple(self.config["base_command"])
-        self.agenda_command = config_to_tuple(self.config["agenda_command"])
-        self.cancel_command = config_to_tuple(self.config["cancel_command"])
+        self.hunger_command = config_to_tuple(self.config["hunger_command"])
+        self.admin_power_level = self.config["admin_power_level"]
 
         # If the locale or timezone is invalid, use default one
         self.db.defaults.locale = self.config["default_locale"]
@@ -94,95 +93,189 @@ class ReminderBot(Plugin):
         if not validate_timezone(self.config["default_timezone"]):
             self.log.warning(f'unknown default timezone: {self.config["default_timezone"]}')
             self.db.defaults.timezone = "UTC"
-
+        self.url_facilities = self.config["url_facilities"]
+        self.url_menus = self.config["url_menus"]
+        self.db.defaults.price = self.config["default_price"]
+        self.db.defaults.facilities = ",".join(self.config["default_facilities"])
 
     async def stop(self) -> None:
         self.scheduler.shutdown(wait=False)
 
+    async def get_facilities_data(self, lang: str) -> Dict:
+        headers = {"Accept": "application/json"}
+        params = {"lang": lang}
+        resp = await self.http.get(self.url_facilities, headers=headers, params=params)
+        if resp.status == 200:
+            data = await resp.json()
+            return data
+        resp.raise_for_status()
+        return None
 
+    async def get_menus_data(self, lang: str) -> Dict:
+        today = date.today().strftime("%Y-%m-%d")
+        tomorrow = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+        headers = {"Accept": "application/json"}
+        params = {"lang": lang, "valid-after": today, "valid-before": tomorrow}
+        resp = await self.http.get(self.url_menus, headers=headers, params=params)
+        if resp.status == 200:
+            data = await resp.json()
+            return data
+        resp.raise_for_status()
+        return None
+
+    async def get_facilities(self, user: str = "") -> Dict:
+        lang = (await self.db.get_user_info(user)).locale
+        facilities_data = await self.get_facilities_data(lang)
+        return parse_facilities(facilities_data)
+
+    async def get_menus(self, user: str = "", facilities_filter: str = None) -> Dict:
+        user_info = await self.db.get_user_info(user)
+        lang = user_info.locale
+        price = user_info.price
+
+        facilities = await self.get_facilities(user)
+        menus_data = await self.get_menus_data(lang)
+
+        if not facilities_filter:
+            facilities_filter = user_info.facilities
+
+        if facilities_filter == "all":
+            facilities_filter = None
+
+        if facilities_filter:
+            facilities = filter_facilities(facilities, facilities_filter)
+
+        return parse_menus(menus_data, facilities, customer=price)
+
+    async def get_markdown_facilities(self, user: str = "") -> Dict | None:
+        facilities = await self.get_facilities(user=user)
+
+        if facilities:
+            return markdown_facilities(facilities)
+        else:
+            return None
+
+    async def get_markdown_menus(self, user: str = "",
+                                 facilities_filter: str = None) -> Dict | None:
+        menus = await self.get_menus(user=user, facilities_filter=facilities_filter)
+
+        if menus:
+            return markdown_menus(menus)
+        else:
+            return None
+
+    async def show_lunch_menu(self, evt: MessageEvent, canteens: str) -> None:
+        markdown_menus = await self.get_markdown_menus(user=evt.sender, facilities_filter=canteens)
+
+        if markdown_menus:
+            await evt.respond(markdown_menus)
+        else:
+            await evt.respond("No results")
+
+    @command.new(name=lambda self: self.hunger_command[0],
+                 aliases=lambda self, alias: alias in self.hunger_command)
+    @command.argument("canteens", pass_raw=True, required=False)
+    async def hunger(self, evt: MessageEvent, canteens: str) -> None:
+        await self.show_lunch_menu(evt, canteens)
 
     @command.new(name=lambda self: self.base_command[0],
-                 aliases=lambda self, alias: alias in self.base_command + self.agenda_command,
-                 help="Create a reminder", require_subcommand=False, arg_fallthrough=False)
-    @command.argument("room", matches="room", required=False)
-    @command.argument("every", matches="every", required=False)
-    @command.argument("start_time", matches="(.*?);", pass_raw=True, required=False)
-    @command.argument("cron", matches="cron ?(?:\s*\S*){0,5}", pass_raw=True, required=False)
-    @command.argument("message", pass_raw=True, required=False)
-    async def create_reminder(self, evt: MessageEvent,
-                              room: str = None,
-                              every: str = None,
-                              start_time: Tuple[str] = None,
-                              cron: Tuple[str] = None,
-                              message: str = None,
-                              again: bool = False) -> None:
-        """Create a reminder or an alarm with a given target
-        Args:
-            evt:
-            room: if true, ping the whole room
-            cron: crontab syntax
-            every: is the reminder recurring?
-            start_time: can be explicitly specified with a semicolon: !remind <start_time>; <message>
-            message: contains both the start_time and the message if not using a semicolon to separate them
-            again:
-        """
-        date_str = None
-        reply_to_id = evt.content.get_reply_to()
-        reply_to = None
+                 aliases=lambda self, alias: alias in self.base_command)
+    async def lunch(self, evt: MessageEvent) -> None:
+        pass
+
+    @lunch.subcommand("menu", aliases=["menus", "show"],
+                      help="Show lunch menu (canteens example: `all` or `poly,food market,fusion`)")
+    @command.argument("canteens", pass_raw=True, required=False)
+    async def show(self, evt: MessageEvent, canteens: str) -> None:
+        await self.show_lunch_menu(evt, canteens)
+
+    @lunch.subcommand("canteen", aliases=["canteens", "mensa"], help="List all canteen names")
+    async def facilities_list(self, evt: MessageEvent) -> None:
+        markdown_facilities = await self.get_markdown_facilities(user=evt.sender)
+
+        if markdown_facilities:
+            await evt.respond(markdown_facilities)
+        else:
+            await evt.respond("No results")
+
+    @lunch.subcommand("config", aliases=["conf"], help="Set or show config settings")
+    async def settings(self, evt: MessageEvent) -> None:
+        pass
+
+    @settings.subcommand("language", aliases=["lang"], help="Set menu language (`en` or `de`)")
+    @command.argument("lang")
+    async def config_lang(self, evt: MessageEvent, lang: str) -> None:
+        if not lang:
+            await evt.reply(f"Menu language is "
+                            f"{(await self.db.get_user_info(evt.sender)).locale}")
+            return
+        if lang in ["en", "de"]:
+            await self.db.set_user_info(evt.sender, key="locale", value=lang)
+            await evt.react("👍")
+        else:
+            await evt.reply(f"Unknown language: `{lang}`\n"
+                            f"Available languages: `en`, `de`")
+
+    @settings.subcommand("canteen", aliases=["canteens", "mensa"],
+                         help="Set canteens (example: `all` or `poly,food market,fusion`)")
+    @command.argument("canteens", pass_raw=True)
+    async def config_canteen(self, evt: MessageEvent, canteens: str) -> None:
+        if not canteens:
+            canteens = (await self.db.get_user_info(evt.sender)).facilities
+            await evt.reply(f"Canteen filter is: `{canteens}`")
+            return
+
+        await self.db.set_user_info(evt.sender, key="facilities", value=canteens)
+        await evt.react("👍")
+
+    @settings.subcommand("price", help="Set price category (`int`, `ext`, `stud` or `off`)")
+    @command.argument("category")
+    async def config_price(self, evt: MessageEvent, category: str) -> None:
+        if not category:
+            category = (await self.db.get_user_info(evt.sender)).price
+            off = " (prices not shown)" if category == "off" else ""
+            await evt.reply(f"Price category is: `{category}`{off}")
+            return
+
+        if category in ["int", "ext", "stud", "off"]:
+            await self.db.set_user_info(evt.sender, key="price", value=category)
+            await evt.react("👍")
+        else:
+            await evt.reply(f"Unknown price category: `{category}`\n"
+                            f"Available price categories: `int`, `ext`, `stud`\n"
+                            f"Disable prices in menus: `off`")
+
+    @lunch.subcommand("remind", help="Create reminder (time: `hh:mm`, days default: `mon-fri`)")
+    @command.argument("time", matches="[0-9]{1,2}:[0-9]{2}")
+    @command.argument("days", required=False)
+    @command.argument("canteens", required=False, pass_raw=True)
+    async def remind(self, evt: MessageEvent,
+                     time: str = None,
+                     days: str = None,
+                     canteens: str = None) -> None:
+        power_levels = await self.client.get_state_event(room_id=evt.room_id,
+                                                         event_type=EventType.ROOM_POWER_LEVELS)
+        user_power = power_levels.users.get(evt.sender, power_levels.users_default)
+
+        if user_power < self.admin_power_level:
+            await evt.reply(f"Power level of {self.admin_power_level} is required")
+            return
+
         user_info = await self.db.get_user_info(evt.sender)
+        hour, minute = tuple(time.split(':'))
 
-        # Determine is the agenda command was used instead of creating a subcommand so [room] can still be used
-        agenda = evt.content.body[1:].startswith(self.agenda_command)
-        if agenda:
-            # Use the date the message was created as the date for agenda items
-            start_time = datetime.now(tz=pytz.UTC)
+        if not days:
+            days = "mon-fri"
 
-        # If we are replying to a previous reminder, recreate the original reminder with a new time
-        if reply_to_id:
-            reply_to = await self.client.get_event(room_id=evt.room_id, event_id=reply_to_id)
-            if "org.bytemarx.reminder" in reply_to.content:
-                again = True
-                start_time = (message,)
-                message = reply_to.content["org.bytemarx.reminder"]["message"]
-                reply_to_id = reply_to.content["org.bytemarx.reminder"]["reply_to"]
-                event_id = reply_to.content["org.bytemarx.reminder"]["id"]
-                if event_id in self.reminders:
-                    await self.reminders[event_id].cancel()
+        cron = f"{minute} {hour} * * {days}"
 
         try:
-            if not cron and not agenda:
-                if start_time:
-                    start_time, date_str = parse_date(start_time[0], user_info)
-                elif message.strip(): # extract the date from the message if not explicitly given
-                    start_time, date_str = parse_date(message, user_info, search_text=True)
-
-                    # Check if "every" appears immediately before the date, if so, the reminder should be recurring.
-                    # This makes "every" possible to use in a sentence instead of just with @command.argument("every")
-                    if not every:
-                        every = message.lower().find('every ' + date_str.lower()) >= 0
-
-                    # Remove the date from the messages, converting "buy ice cream on monday" to "buy ice cream"
-                    compiled = re.compile("(every )?" + re.escape(date_str), re.IGNORECASE)
-                    message = compiled.sub("", message,  1).strip()
-
-                else: # If no arguments are supplied, return the help message
-                    await evt.reply(self._help_message())
-                    return
-
-            # If the reminder was created by replying to a message, use that message's text
-            if reply_to_id and not message:
-                message = reply_to.content["body"]
-
             reminder = Reminder(
                 bot=self,
                 room_id=evt.room_id,
-                message=message,
+                message=canteens,
                 event_id=evt.event_id,
-                reply_to=reply_to_id,
-                start_time=start_time,
                 cron_tab=cron,
-                recur_every=date_str if every else None,
-                is_agenda=agenda,
                 creator=evt.sender,
                 user_info=user_info,
             )
@@ -191,198 +284,49 @@ class ReminderBot(Plugin):
             await evt.reply(e.message)
             return
 
-        # Record the reminder and subscribe to it
         await self.db.store_reminder(reminder)
-
-        # If the command was called with a "room_command", make the reminder ping the room
-        user_id = UserID("@room") if room else evt.sender
-        await reminder.add_subscriber(subscribing_event=evt.event_id, user_id=user_id)
-
-        # Send a message to the room confirming the creation of the reminder
-        await self.confirm_reminder(evt, reminder, again=again, agenda=agenda)
-
+        await self.confirm_reminder(evt, reminder)
         self.reminders[reminder.event_id] = reminder
 
-
-    async def confirm_reminder(self, evt: MessageEvent, reminder: Reminder, again: bool = False, agenda: bool = False):
-        """Sends a message to the room confirming the reminder is set
-        If verbose is set in the config, print out the full message. If false, just react with 👍
-
-        Args:
-            evt:
-            reminder: The Reminder to confirm
-            again: Is this a reminder that was rescheduled?
-            agenda: Is this an agenda instead of a reminder?
-        """
+    async def confirm_reminder(self, evt: MessageEvent, reminder: Reminder):
         confirmation_event = await evt.react("\U0001F44D")
-
-        if self.config["verbose"]:
-
-            action = "add this to the agenda for" if agenda else "remind" if reminder.message else "ping"
-            target = "the room" if "@room" in reminder.subscribed_users.values() else "you"
-            message = f"to {reminder.message}" if reminder.message else ""
-
-            if reminder.reply_to:
-                evt_link = f"[message](https://matrix.to/#/{reminder.room_id}/{reminder.reply_to})"
-                message += f" (replying to that {evt_link})" if reminder.message else f" about that {evt_link}"
-
-            msg = f"I'll {action} {target} {message}"
-            msg += " again" if again else ""
-
-            if again:
-                msg += " again"
-            if not agenda:
-                formatted_time = reminder.formatted_time(await self.db.get_user_info(evt.sender))
-                msg += " " + formatted_time
-
-
-            confirmation_event = await evt.reply(f"{msg}\n\n"
-                            f"(others can \U0001F44D the message above to get pinged too)")
-
         await reminder.set_confirmation(confirmation_event)
 
+        body = "Reminder"
+        if reminder.message:
+            body += f" for `{reminder.message}`"
+        body += " scheduled"
+        if reminder.recur_every or reminder.cron_tab:
+            user_info = await self.db.get_user_info(evt.sender)
+            formatted_time = reminder.formatted_time(user_info)
+            body += f" {formatted_time}"
+        body += ".\n\nAnyone can \U0001F44D the command message above to get pinged."
 
-    # @command.new("cancel", help="Cancel a recurring reminder", aliases=("delete",))
-    @create_reminder.subcommand(name=lambda self: self.cancel_command[0],
-                                help="Cancel a recurring reminder",
-                                aliases=lambda self, alias: alias in self.cancel_command)
-    @command.argument("search_text", pass_raw=True, required=False)
-    async def cancel_reminder(self, evt: MessageEvent, search_text: str) -> None:
-        """Cancel a reminder by replying to a reminder, or searching by either message or event ID"""
+        await evt.reply(body)
 
-        reminder = []
+    @lunch.subcommand("cancel", help="Cancel reminder")
+    async def cancel_reminder(self, evt: MessageEvent) -> None:
+        reminders = []
         if evt.content.get_reply_to():
             reminder_message = await self.client.get_event(evt.room_id, evt.content.get_reply_to())
-            if "org.bytemarx.reminder" not in reminder_message.content:
+            if "ch.ethz.phys.lunch" not in reminder_message.content:
                 await evt.reply("That doesn't look like a valid reminder event.")
                 return
-            reminder = self.reminders[reminder_message.content["org.bytemarx.reminder"]["id"]]
-        elif search_text:
-            # First, check the reminders created by the user, then everything else
-            for rem in sorted(self.reminders.values(), key=lambda x: x.creator == evt.sender, reverse=True):
-                # Using the first four base64 digits of the hash, p(collision) > 0.01 at ~10000 reminders
-                if rem.event_id[1:5] == search_text or re.match(re.escape(search_text.strip()), rem.message.strip(), re.IGNORECASE):
-                # if rem.event_id[1:5] == search_text or rem.message.upper().strip() == search_text.upper().strip():
-                    reminder = rem
-                    break
-        else: # Display the help message
-            await evt.reply(CommandSyntax.REMINDER_CANCEL.value.format(base_command=self.base_command[0],
-                                            cancel_command=self.cancel_command[0],
-                                            cancel_aliases="|".join(self.cancel_command)))
-            return
-
-        if not reminder:
-            await evt.reply(f"It doesn't look like you have any reminders matching the text `{search_text}`")
-            return
-
-        power_levels = await self.client.get_state_event(room_id=reminder.room_id,event_type=EventType.ROOM_POWER_LEVELS)
-        user_power = power_levels.users.get(evt.sender, power_levels.users_default)
-
-        if reminder.creator == evt.sender or user_power >= self.config["admin_power_level"]:
-            await reminder.cancel()
-            await evt.reply("Reminder cancelled!") if self.config["verbose"] else await evt.react("👍")
+            reminders = [self.reminders[reminder_message.content["ch.ethz.phys.lunch"]["id"]]]
         else:
-            await evt.reply(f"Power levels of {self.config['admin_power_level']} are required to cancel other people's reminders")
+            reminders = [v for k, v in self.reminders.items() if v.room_id == evt.room_id]
 
+        for reminder in reminders:
+            power_levels = await self.client.get_state_event(room_id=reminder.room_id,
+                                                             event_type=EventType.ROOM_POWER_LEVELS)
+            user_power = power_levels.users.get(evt.sender, power_levels.users_default)
 
-    @create_reminder.subcommand("help", help="Usage instructions")
-    async def help(self, evt: MessageEvent) -> None:
-        await evt.reply(self._help_message(), allow_html=True)
+            if reminder.creator == evt.sender or user_power >= self.admin_power_level:
+                await reminder.cancel()
+            else:
+                await evt.reply(f"Power level of {self.admin_power_level} is required")
 
-
-    @create_reminder.subcommand("list", help="List your reminders")
-    @command.argument("my", parser=lambda x: (re.sub(r"\bmy\b", "", x), re.search(r"\bmy\b", x)), required=False, pass_raw=True) # I hate it but it makes arguments not positional
-    @command.argument("subscribed", parser=lambda x: (re.sub(r"\bsubscribed\b", "", x), re.search(r"\bsubscribed\b", x)), required=False, pass_raw=True)
-    @command.argument("all", parser=lambda x: (re.sub(r"\ball\b", "", x), re.search(r"\ball\b", x)), required=False, pass_raw=True)
-    async def list(self, evt: MessageEvent, all: str, subscribed: str, my: str) -> None:
-        """Print out a formatted list of all the reminders for a user
-
-        Args:
-            evt: message event
-            my:  only list reminders the user created
-            all: list all reminders in every room
-            subscribed: only list reminders the user is subscribed to
-        """
-        room_id = None if all else evt.room_id
-        user_info = await self.db.get_user_info(evt.sender)
-        categories = {"**📜 Agenda items**": [], '**📅 Cron reminders**': [], '**🔁 Repeating reminders**': [], '**1️⃣ One-time reminders**': []}
-
-        # Sort the reminders by their next run date and format as bullet points
-        for reminder in sorted(self.reminders.values(), key=lambda x: x.job.next_run_time if x.job else datetime(2000,1,1,tzinfo=pytz.UTC)):
-            if (
-                    (not subscribed or any(x in reminder.subscribed_users.values() for x in [evt.sender, "@room"])) and
-                    (not my or evt.sender == reminder.creator) and
-                    (all or reminder.room_id == room_id)):
-
-                message = reminder.message
-                next_run = reminder.formatted_time(user_info)
-                short_event_id = f"[`{reminder.event_id[1:5]}`](https://matrix.to/#/{reminder.room_id}/{reminder.event_id})"
-
-                if reminder.reply_to:
-                    evt_link = f"[event](https://matrix.to/#/{reminder.room_id}/{reminder.reply_to})"
-                    message = f'{message} (replying to {evt_link})' if message else evt_link
-
-                if reminder.cron_tab:
-                    category = "**📅 Cron reminders**"
-                elif reminder.recur_every:
-                    category = "**🔁 Repeating reminders**"
-                elif not reminder.is_agenda:
-                    category = "**1️⃣ One-time reminders**"
-                else:
-                    category = "**📜 Agenda items**"
-
-                room_link = f"https://matrix.to/#/{reminder.room_id}" if all else ""
-                # creator_link = await make_pill(reminder.creator) if not my else ""
-
-                categories[category].append(f"* {short_event_id + room_link} {next_run}  **{message}**")
-
-        # Upack the nested dict into a flat list of reminders seperated by category
-        in_room_msg = " in this room" if room_id else ""
-        output = []
-        for category, reminders in categories.items():
-            if reminders:
-                output.append("\n" + category + in_room_msg)
-                for reminder in reminders:
-                    output.append(reminder)
-        output = "\n".join(output)
-
-        if not output:
-            await evt.reply(f"You have no upcoming reminders{in_room_msg} :(")
-
-        await evt.reply(output + f"\n\n`!{self.base_command[0]} list [all] [my] [subscribed]`\\"
-                                 f"\n`!{self.base_command[0]} {self.cancel_command[0]} [4-letter ID or start of message]`")
-
-
-
-    @create_reminder.subcommand("locale", help="Set your locale")
-    @command.argument("locale", required=False, pass_raw=True)
-    async def locale(self, evt: MessageEvent, locale: str) -> None:
-        if not locale:
-            await evt.reply(f"Your locale is `{(await self.db.get_user_info(evt.sender)).locale}`")
-            return
-        if validate_locale(locale):
-            await self.db.set_user_info(evt.sender, key="locale", value=locale)
-            await evt.reply(f"Setting your locale to {locale}")
-        else:
-            await evt.reply(f"Unknown locale: `{locale}`\n\n"
-                            f"[Available locales](https://dateparser.readthedocs.io/en/latest/supported_locales.html)"
-                            f" (case sensitive)")
-
-
-
-    @create_reminder.subcommand("timezone", help="Set your timezone", aliases=("tz",))
-    @command.argument("timezone", required=False, pass_raw=True)
-    async def timezone(self, evt: MessageEvent, timezone: pytz.timezone) -> None:
-        if not timezone:
-            await evt.reply(f"Your timezone is `{(await self.db.get_user_info(evt.sender)).timezone}`")
-            return
-        if validate_timezone(timezone):
-            await self.db.set_user_info(evt.sender, key="timezone", value=timezone)
-            await evt.reply(f"Setting your timezone to {timezone}")
-        else:
-            await evt.reply(f"Unknown timezone: `{timezone}`\n\n"
-                            f"[Available timezones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)")
-
+        await evt.react("👍")
 
     @command.passive(regex=r"(?:\U0001F44D[\U0001F3FB-\U0001F3FF]?)",
                      field=lambda evt: evt.content.relates_to.key,
@@ -396,7 +340,6 @@ class ReminderBot(Plugin):
         if reminder:
             await reminder.add_subscriber(user_id=evt.sender, subscribing_event=evt.event_id)
 
-
     @event.on(EventType.ROOM_REDACTION)
     async def redact(self, evt: RedactionEvent) -> None:
         """Unsubscribe from a reminder by redacting the message"""
@@ -409,41 +352,39 @@ class ReminderBot(Plugin):
                     await reminder.cancel(redact_confirmation=True)
                 break
 
-
     @event.on(EventType.ROOM_TOMBSTONE)
     async def tombstone(self, evt: StateEvent) -> None:
         """If a room gets upgraded or replaced, move any reminders to the new room"""
         if evt.content.replacement_room:
             await self.db.update_room_id(old_id=evt.room_id, new_id=evt.content.replacement_room)
 
+    @lunch.subcommand("help", help="Show the help")
+    async def help(self, evt: MessageEvent) -> None:
+        await evt.reply(self._help_message())
+
     def _help_message(self) -> str:
-        return f"""
-**⏰ Maubot [Reminder](https://github.com/MxMarx/reminder) plugin**\\
-TLDR: `!{self.base_command[0]} every friday 3pm take out the trash` `!{self.base_command[0]} {self.cancel_command[0]} take out the trash`
-
-**Creating optionally recurring reminders:**
-{CommandSyntax.REMINDER_CREATE.value.format(base_command=self.base_command[0],
-                                            base_aliases="|".join(self.base_command))}
-
-**Creating agenda items**
-{CommandSyntax.AGENDA_CREATE.value.format(agenda_command="|".join(self.agenda_command))}
-
-**Listing active reminders**
-{CommandSyntax.REMINDER_LIST.value.format(base_command=self.base_command[0])}
-
-**Deleting reminders**
-
-{CommandSyntax.REMINDER_CANCEL.value.format(base_command=self.base_command[0],
-                                            cancel_command=self.cancel_command[0],
-                                            cancel_aliases="|".join(self.cancel_command))}
-
-**Rescheduling**
-
-{CommandSyntax.REMINDER_RESCHEDULE.value.format(base_command=self.base_command[0])}
-
-**Settings**
-
-{CommandSyntax.REMINDER_SETTINGS.value.format(base_command=self.base_command[0],
-                                              default_tz=self.db.defaults.timezone,
-                                              default_locale=self.db.defaults.locale)}
-"""
+        bc = f"!{self.base_command[0]}"
+        hc = f"`!{'`, `!'.join(self.hunger_command)}`"
+        default_facilities_markdown = '\n- '.join(self.config["default_facilities"])
+        return (f"Type `{bc}` for available subcommands and syntax\n\n"
+                f"Type `{bc} menu` to show the lunch menus of the day\n\n"
+                f"By default the menus for then following canteens are shown:\n"
+                f"- {default_facilities_markdown}\n\n"
+                f"Type `{bc} canteens` to show all available canteens\n\n"
+                f"Type `{bc} config` for configuration settings and syntax\n\n"
+                f"Type `{bc} config canteen <canteens>` to configure other canteens.\n\n"
+                f"Replace `<canteens>` with a comma-separated list of canteen names,\n"
+                f"a comma-separated list of sequences of characters matching parts of\n"
+                f"canteen names (example: `poly,food market,fusion`) or `all`.\n"
+                f"This will store your canteen selection and remember it for any commands\n"
+                f"or reminders without explicit `[canteens]` selection.\n\n"
+                f"Type `{bc} config language de` to show menus in German\n\n"
+                f"Type `{bc} config price off` to hide menu prices\n\n"
+                f"Type `{bc} remind 11:00` to schedule a reminder in the room.\n"
+                f"The bot will then send the lunch menu every weekday at the specified time.\n"
+                f"A power level of {self.admin_power_level} is required for reminders.\n\n"
+                f"React with \U0001F44D to any `{bc} remind` command message\n"
+                f"to get pinged (mentioned) in the reminder.\n\n"
+                f"Type `{bc} cancel` in a new message to cancel all reminders in the room\n"
+                f"or reply to a reminder to cancel a specific reminder\n\n"
+                f"The following commands are aliases for the `{bc} menu` subcommand: {hc}")

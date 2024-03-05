@@ -1,45 +1,40 @@
-# https://github.com/MxMarx/reminder
-# Feature requests welcome!
+# Default timezone
+default_timezone: Europe/Zurich
 
-# Default timezone for users who did not set one.
-# This is parsed with dateparser, so Continent/City, UTC offsets, and abbreviations should work.
-#  e.g. Europe/Helsinki, EET, +0300
-# See https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
-default_timezone: America/Los_Angeles
-
-# Default locale/language compatible with dateparser
-# See https://dateparser.readthedocs.io/en/latest/supported_locales.html
+# Default language (locale) `en` or `de`
 default_locale: en
 
 # Base command without the prefix (!).
 # If a list is provided, the first is the main name and the rest are aliases.
 base_command:
-- remind
-- remindme
+  - lunch
 
-# Agenda items are like reminders but don't have a time, for things like to-do lists.
-# Aliases used to create an agenda items by calling "!agenda <message>":
-agenda_command:
-- agenda
-- todo
-
-# subcommands used to cancel reminders
-cancel_command:
-- cancel
-- delete
-
-# If verbose is true, display full confirmation messages. If false, confirm by reacting with :thumbs-up:
-verbose: true
+# Hunger command (same as the `!<base_command> menu` subcommand)
+hunger_command:
+  - hunger
+  - hungry
+  - food
+  - essen
+  - lunchmenu
 
 # Rate limit for individual users, as the number of reminders allowed to fire in an interval
 rate_limit: 10
 rate_limit_minutes: 60
 
-# Power level needed to delete someone else's reminder
+# Power level needed to create reminders and delete someone else's reminders
 admin_power_level: 50
 
-# time_format: strftime format when listing reminders.
-#   "%-I:%M%P %Z on %A, %B %-d %Y"  - 7:36pm PDT on Sunday, September 17 2023
-#   "%Y-%m-%d %H:%M %Z"             - 2023-09-17 19:36 PDT
-#   Currently, reminders within 7 days will be displayed as just the relative delta, e.g. "2 days and 1 hour"
-time_format: "%-I:%M%P %Z on %A, %B %-d %Y"
+# time_format: strftime format when listing reminders
+time_format: "%Y-%m-%d %H:%M %Z"
+
+# URLs of cookpit api https://idapps.ethz.ch/cookpit-pub-services/swagger-ui/
+url_facilities: https://idapps.ethz.ch/cookpit-pub-services/v1/facilities/?client-id=ethz-wcms&rs-first=0&rs-size=50
+url_menus: https://idapps.ethz.ch/cookpit-pub-services/v1/weeklyrotas/?client-id=ethz-wcms&rs-first=0&rs-size=50
+
+# Default facilities filter
+default_facilities:
+  - food market
+  - fusion meal
+
+# Default price to show (one of `int`, `ext`, `stud` or `off`)
+default_price: int
