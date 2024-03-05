@@ -25,7 +25,7 @@ from mautrix.util.async_db import UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from .migrations import upgrade_table
-from .db import ReminderDatabase
+from .db import ETHzLunchDatabase
 from .util import validate_locale, validate_timezone, CommandSyntaxError
 from .reminder import Reminder
 from .ethz import (parse_facilities, parse_menus, filter_facilities, markdown_facilities,
@@ -49,14 +49,14 @@ class Config(BaseProxyConfig):
         helper.copy("default_facilities")
 
 
-class ReminderBot(Plugin):
+class ETHzLunchBot(Plugin):
     base_command: Tuple[str, ...]
     hunger_command: Tuple[str, ...]
     default_timezone: pytz.timezone
     admin_power_level: int
     scheduler: AsyncIOScheduler
     reminders: Dict[EventID, Reminder]
-    db: ReminderDatabase
+    db: ETHzLunchDatabase
     url_facilities: str
     url_menus: str
 
@@ -71,7 +71,7 @@ class ReminderBot(Plugin):
     async def start(self) -> None:
         self.scheduler = AsyncIOScheduler()
         self.scheduler.start()
-        self.db = ReminderDatabase(self.database)
+        self.db = ETHzLunchDatabase(self.database)
         self.on_external_config_update()
         self.reminders = await self.db.load_all(self)
 
@@ -245,7 +245,8 @@ class ReminderBot(Plugin):
                             f"Available price categories: `int`, `ext`, `stud`\n"
                             f"Disable prices in menus: `off`")
 
-    @lunch.subcommand("remind", help="Create reminder (time: `hh:mm`, days default: `mon-fri`)")
+    @lunch.subcommand("remind", aliases=["reminder"],
+                      help="Create reminder (time: `hh:mm`, days default: `mon-fri`)")
     @command.argument("time", matches="[0-9]{1,2}:[0-9]{2}")
     @command.argument("days", required=False)
     @command.argument("canteens", required=False, pass_raw=True)

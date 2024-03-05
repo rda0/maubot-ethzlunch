@@ -29,7 +29,7 @@ from mautrix.types import UserID, EventID, RoomID
 
 
 if TYPE_CHECKING:
-    from .bot import ReminderBot
+    from .bot import ETHzLunchBot
 
 from .reminder import Reminder
 
@@ -37,7 +37,7 @@ from .reminder import Reminder
 logger = logging.getLogger(__name__)
 
 
-class ReminderDatabase:
+class ETHzLunchDatabase:
     cache: DefaultDict[UserID, UserInfo]
     db: Database
     defaults: UserInfo
@@ -125,7 +125,7 @@ class ReminderDatabase:
             reminder.is_agenda,
             reminder.creator)
 
-    async def load_all(self, bot: ReminderBot) -> Dict[EventID, Reminder]:
+    async def load_all(self, bot: ETHzLunchBot) -> Dict[EventID, Reminder]:
         """ Load all reminders in the database and return them as a dict for the main bot
         Args:
             bot: it feels dirty to do it this way, but it seems to work and make code cleaner

@@ -1,1 +1,1 @@
-from .bot import ReminderBot
+from .bot import ETHzLunchBot

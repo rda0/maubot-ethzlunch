@@ -3,8 +3,8 @@ id: ch.ethz.phys.lunch
 version: 0.0.2
 license: AGPL-3.0-or-later
 modules:
-- reminder
-main_class: ReminderBot
+- ethzlunch
+main_class: ETHzLunchBot
 extra_files:
 - base-config.yaml
 dependencies:

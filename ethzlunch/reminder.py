@@ -18,7 +18,7 @@ except ImportError:
     USE_CRON_DESCRIPTOR = False
 
 if TYPE_CHECKING:
-    from .bot import ReminderBot
+    from .bot import ETHzLunchBot
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class Reminder(object):
     def __init__(
         self,
-        bot: ReminderBot,
+        bot: ETHzLunchBot,
         room_id: RoomID,
         message: str,
         event_id: Optional[EventID] = None,
