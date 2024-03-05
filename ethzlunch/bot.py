@@ -349,9 +349,9 @@ class ETHzLunchBot(Plugin):
                 await reminder.remove_subscriber(subscribing_event=evt.redacts)
 
                 # If the reminder has no users left, cancel it
-                if not reminder.subscribed_users or reminder.event_id == evt.redacts:
-                    await reminder.cancel(redact_confirmation=True)
-                break
+                # if not reminder.subscribed_users or reminder.event_id == evt.redacts:
+                #     await reminder.cancel(redact_confirmation=True)
+                # break
 
     @event.on(EventType.ROOM_TOMBSTONE)
     async def tombstone(self, evt: StateEvent) -> None:
