@@ -28,8 +28,8 @@ admin_power_level: 50
 time_format: "%Y-%m-%d %H:%M %Z"
 
 # URLs of cookpit api https://idapps.ethz.ch/cookpit-pub-services/swagger-ui/
-url_facilities: https://idapps.ethz.ch/cookpit-pub-services/v1/facilities/?client-id=ethz-wcms&rs-first=0&rs-size=50
-url_menus: https://idapps.ethz.ch/cookpit-pub-services/v1/weeklyrotas/?client-id=ethz-wcms&rs-first=0&rs-size=50
+url_facilities: https://idapps.ethz.ch/cookpit-pub-services/v1/facilities?client-id=ethz-wcms&rs-first=0&rs-size=50
+url_menus: https://idapps.ethz.ch/cookpit-pub-services/v1/weeklyrotas?client-id=ethz-wcms&rs-first=0&rs-size=50
 
 # Default facilities filter
 default_facilities:
